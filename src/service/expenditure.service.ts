@@ -76,6 +76,11 @@ export async function getfiledata(prompt: string, file: string) {
           });
           extractedText = response.data.text;
           console.log("Extracted text:", response.data.text);
+          console.log("OCR URL IN CODE:", 
+            "https://flaskocr-bwctd7d9d0gvgveu.canadacentral-01.azurewebsites.net/ocr"
+          );
+          console.log("ENV OCR URL:", process.env.OCR_SERVICE_URL);
+
         } catch (error) {
           console.error("OCR Error:", error.response?.data || error.message);
         }
