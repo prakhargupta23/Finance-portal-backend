@@ -70,7 +70,7 @@ export async function getfiledata(prompt: string, file: string) {
         // const extractedText = await readFromTxtFile('./src/service/extracted.txt')
         let extractedText = "";
         try {
-          const response = await axios.post('https://myocrapp.azurewebsites.net/ocr', {
+          const response = await axios.post('https://flaskocr-bwctd7d9d0gvgveu.canadacentral-01.azurewebsites.net/ocr', {
             pdfBase64: file
           });
           extractedText = response.data.text;
