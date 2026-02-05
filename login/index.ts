@@ -1,8 +1,6 @@
 import { AzureFunction, Context, HttpRequest } from "@azure/functions";
 const jwt = require("jsonwebtoken");
 import * as dotenv from 'dotenv';
-import { loginlog } from "../src/service/pensionlog.service";
-import { pfaloginlog } from "../src/service/pfalog.service";
 dotenv.config();
 
 
@@ -82,11 +80,7 @@ const httpTrigger: AzureFunction = async function (
       (user) => user.username === username && user.password === password && user.portal === portal
     );
     console.log("Matched User:", matchedUser);
-    if(portal === 'Pension'){
-      loginlog(username, matchedUser? "Success" : "Failure");
-    } else if(portal === 'expenditure'){
-      pfaloginlog(username, matchedUser? "Success" : "Failure");
-    }
+    
     
     console.log("Matched User:2", matchedUser);
 

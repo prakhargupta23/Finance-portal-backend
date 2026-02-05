@@ -1,4 +1,0 @@
-{
-  "name": "get-gstinvoice-data",
-  "description": "Azure Function to retrieve all GST Invoice data from the database"
-} 
