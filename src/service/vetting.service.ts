@@ -30,6 +30,7 @@ export async function persistVettingData(
                     flowUuid: (flowRow as any).uuid,
                     sequenceNo: flow.sequenceNo,
                     designation: flow.designationCanonical,
+                    department: flow.department ?? null,                      
                     actionDate: flow.actionDate,
                     actionTime: flow.actionTime,
                     isCurrentPending: false,
@@ -55,5 +56,25 @@ export async function persistVettingData(
             saved: false,
             error: Error?.message || "Failed to save vetting data",
         };
+    }
+}
+
+export async function getVettingData(): Promise<any> {
+    try {
+        const flowData = await WorkVettingDesignationFlow.findAll({
+            raw: true,
+        }); 
+        const designationflowData = await WorkVettingDesignationFlowItem.findAll({
+            raw: true,
+        }); 
+        const data = {
+            docdata: flowData,
+            flowdata: designationflowData
+        }
+        console.log("Fetched vetting data from the database:", data);
+        return data;
+    } catch (error: any) {
+        console.error("Error fetching vetting data:", error);
+        throw new Error("Failed to fetch vetting data");
     }
 }

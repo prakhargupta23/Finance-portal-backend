@@ -1,123 +1,86 @@
 import { getGpt4oResponse } from "./ai.service";
-import sequelize from "../config/sequelize";
-import axios from 'axios';
-
+import axios from "axios";
 
 export async function getfiledata(prompt: string, file: string) {
     try {
-        console.log("ocr reached",file[0]?"yes":"no");
+        console.log("ocr reached", file[0] ? "yes" : "no");
 
-
-      
         let extractedText = "";
+
         try {
-          const response = await axios.post('https://ocrappnwrsup-bwhhbsenaeb8gqdm.canadacentral-01.azurewebsites.net/ocr', {
-            pdfBase64: file
-          });
-          extractedText = response.data.text;
-          //console.log("Extracted text:", response.data.text);
+            const response = await axios.post(
+                "https://ocrappnwrsup-bwhhbsenaeb8gqdm.canadacentral-01.azurewebsites.net/ocr",
+                {
+                    pdfBase64: file
+                }
+            );
 
-        } catch (error) {
-          console.error("OCR Error:", error.response?.data || error.message);
+            extractedText = response.data.text;
+
+            console.log("========== RAW OCR TEXT ==========");
+            console.log(extractedText);
+            console.log("==================================");
+
+        } catch (error: any) {
+            console.error("OCR Error:", error.response?.data || error.message);
         }
-        
-        
-        
-        const jsonPrompt = `${prompt} 
 
-            From the text given below, extract the following information strictly following the rules mentioned in each section.
-// ========================
-// WHAT TO EXTRACT
-// ========================
+        const jsonPrompt = `${prompt}
 
-// 1. plan_head  
-//    - Extract the Plan Head value exactly as it appears.
-//    - Do NOT merge it with Work Name.
-//    - Do NOT return words like "PLAN", "HEAD", or "WORK".
+From the text given below, extract the following information strictly following the rules mentioned.
 
-// 2. work_name  
-//    - Extract the full work name / description exactly as written.
-//    - Keep it separate from Plan Head.
+CRITICAL RULES:
+1. Extract plan_head exactly as written.
+2. Extract work_name exactly as written.
+3. Extract designation, date and time from the approval flow.
+   
+DESIGNATION EXTRACTION RULES (VERY IMPORTANT):
+- Keep the COMPLETE designation exactly as it appears, including everything after the forward slash (/).
+- Examples:
+  * If text shows "SR. DFM/JU" → extract as "SR. DFM/JU" (NOT "SR. DFM")
+  * If text shows "SDEE/JU" → extract as "SDEE/JU" (NOT "SDEE")
+  * If text shows "CCM/NWR" → extract as "CCM/NWR" (NOT "CCM")
+  * If text shows "Sr. DEN (Co)/JU" → extract as "Sr. DEN (Co)/JU"
+  * If text shows "SRDEN/ CENTRAL" → extract as "SRDEN/CENTRAL"
+- DO NOT remove or truncate anything after the "/" character
+- The part after "/" is the department code and MUST be preserved
 
-// 3. designation and datetime extraction   
-//  - Remove the letter after the / in the designation. For example, "Sr.Den/Line" should be extracted as "Sr.Den".
+4. Extract dates in the format shown (DD/MM/YYYY or similar)
+5. Extract times in the format shown (HH:MM:SS)
 
-// ========================
-// Role and time extraction FLOW RULES
-// ========================
+Return STRICT JSON only in this format:
+{
+  "plan_head": "...",
+  "work_name": "...",
+  "right_side_flow": [
+    {
+      "designation": "COMPLETE designation with /DEPARTMENT",
+      "date": "DD/MM/YYYY",
+      "time": "HH:MM:SS"
+    }
+  ]
+}
 
+OCR TEXT:
+${extractedText}
+`;
 
+        const data = await getGpt4oResponse(jsonPrompt, { extractedText });
 
+        console.log("========== GPT OUTPUT ==========");
+        console.log(JSON.stringify(data, null, 2));
+        console.log("================================");
 
-// - Treat a line as a designation ONLY if:
-//   - a date and time appear with it (same block or immediately after).
-// - If a designation appears without date and time, DO NOT extract it.
-// - If designation and date/time appear together, extract them as one entry.
-// - Extract ONLY:
-//   - designation
-//   - date
-//   - time
-// - Follow the top-to-bottom order as it appears on the right side of the document.
-// - Do NOT infer flow using author/receiver logic.
-// - Do NOT add actions or statuses.
+        // ✅ Return data with raw OCR text for fallback processing
+        return {
+            ...data,
+            raw_text: extractedText
+        } as any; // ← Add this to avoid TypeScript errors
 
-// ========================
-// OUTPUT FORMAT (STRICT)
-// ========================
-
-// {
-//   "plan_head": "...",
-//   "work_name": "...",
-//   "right_side_flow": [
-//     {
-//       "designation": "...",
-//       "date": "...",
-//       "time": "..."
-//     }
-//   ]
-// }
-
-// If any value is missing, return null.
-// Return ONLY valid JSON. No explanations.
-
-// ========================
-// OCR TEXT
-// ========================
-
-// {{OCR_TEXT_HERE}}
-
-
-
-
-
-
-
-
-              ${extractedText}`;
-        const data = await getGpt4oResponse(jsonPrompt, {extractedText});
-        const tofilterdata = data?.right_side_flow || [];
-        const cleanedData = tofilterdata.map(item => ({
-          ...item,
-          designation: item.designation.replace(/\/.*/, '')
-        }));
-        data.right_side_flow = cleanedData;
-        return data;
     } catch (error) {
         console.error("Error in getfiledata:", error);
         throw error;
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
 
 
