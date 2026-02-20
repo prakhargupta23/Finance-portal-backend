@@ -12,6 +12,7 @@ const WorkVettingDesignationFlow = sequelize.define(
     },
 
     planhead: {
+      
       type: DataTypes.STRING(255),
       allowNull: true,
     },

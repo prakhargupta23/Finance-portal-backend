@@ -3,11 +3,16 @@ import axios from "axios";
 
 export async function getfiledata(prompt: string, file: string) {
     try {
-        console.log("ocr reached", file[0] ? "yes" : "no");
+        console.log("[FIN][OCR] Input received", {
+            hasFile: Boolean(file),
+            fileLength: file?.length ?? 0,
+            promptLength: prompt?.length ?? 0
+        });
 
         let extractedText = "";
 
         try {
+            console.log("[FIN][OCR] Calling OCR service");
             const response = await axios.post(
                 "https://ocrappnwrsup-bwhhbsenaeb8gqdm.canadacentral-01.azurewebsites.net/ocr",
                 {
@@ -16,13 +21,16 @@ export async function getfiledata(prompt: string, file: string) {
             );
 
             extractedText = response.data.text;
+            console.log("[FIN][OCR] OCR response received", {
+                textLength: extractedText?.length ?? 0
+            });
 
             console.log("========== RAW OCR TEXT ==========");
             console.log(extractedText);
             console.log("==================================");
 
         } catch (error: any) {
-            console.error("OCR Error:", error.response?.data || error.message);
+            console.error("[FIN][OCR] OCR Error:", error.response?.data || error.message);
         }
 
         const jsonPrompt = `${prompt}
@@ -65,6 +73,10 @@ OCR TEXT:
 ${extractedText}
 `;
 
+        console.log("[FIN][GPT] Sending OCR text to GPT", {
+            promptLength: jsonPrompt.length,
+            textLength: extractedText?.length ?? 0
+        });
         const data = await getGpt4oResponse(jsonPrompt, { extractedText });
 
         console.log("========== GPT OUTPUT ==========");
