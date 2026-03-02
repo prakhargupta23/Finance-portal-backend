@@ -25,6 +25,10 @@ const WorkVettingDesignationFlowItem = sequelize.define(
       type: DataTypes.STRING(255),
       allowNull: true,
     },
+    department: {
+      type: DataTypes.STRING(255),
+      allowNull:true
+    },
 
     actionDate: {
       type: DataTypes.DATEONLY,
