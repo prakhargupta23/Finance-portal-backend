@@ -7,9 +7,9 @@ const httpTrigger: AzureFunction = async function (
 ): Promise<void> {
 
     try {
-
+        console.log("Fetching vetting data");
         const vettingData = await getVettingData();
-
+        console.log("returning to frontend")
         context.res = {
             status: 200,
             body: {
