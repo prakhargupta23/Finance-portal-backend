@@ -18,21 +18,23 @@ const httpTrigger: AzureFunction = async function (
             (req.body as any)?.workHead ??
             (req.body as any)?.workname;
         const workhead = String(queryWorkhead ?? bodyWorkhead ?? "").trim() || null;
+        const querySNo = (req.query as any)?.masterId ?? (req.query as any)?.master_id ?? (req.query as any)?.s_no;
+        const bodySNo = (req.body as any)?.masterId ?? (req.body as any)?.master_id ?? (req.body as any)?.s_no;
+        const sNo = querySNo || bodySNo ? String(querySNo ?? bodySNo).trim() : null;
+
         const queryStrict = (req.query as any)?.strict;
         const bodyStrict = (req.body as any)?.strict;
         const strictRaw = String(queryStrict ?? bodyStrict ?? "true").trim().toLowerCase();
         const strict = !(strictRaw === "false" || strictRaw === "0" || strictRaw === "no");
 
-        const delays = await getAggregateDelayData(planhead, workhead, strict);
+        const delayData = await getAggregateDelayData(planhead, workhead, sNo, strict);
         const hasRequestedFilter = Boolean(planhead || workhead);
-        const noCaseMatch = !delays?.meta?.selectedPlanhead && !delays?.meta?.flowUuid;
 
-        if (hasRequestedFilter && noCaseMatch) {
+        if (hasRequestedFilter && !delayData) {
             context.res = {
                 status: 404,
                 body: {
                     error: "No matching vetting case found for provided planHead/workHead",
-                    delays,
                 },
             };
             return;
@@ -41,7 +43,8 @@ const httpTrigger: AzureFunction = async function (
         context.res = {
             status: 200,
             body: {
-                delays,
+                ...delayData,
+                gmApprovalDate: delayData?.meta?.gmApprovalDate ?? null,
             },
         };
     } catch (error: any) {
