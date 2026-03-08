@@ -90,26 +90,85 @@ function extractDepartment(item: DelayInputItem): string {
 
 function diffDays(start: Date | null, end: Date | null): number {
   if (!start || !end) return 0;
-  const startUtc = Date.UTC(
-    start.getUTCFullYear(),
-    start.getUTCMonth(),
-    start.getUTCDate()
-  );
-  const endUtc = Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate());
-  const ms = endUtc - startUtc;
-  if (ms <= 0) return 0;
-  return Math.round(ms / (1000 * 60 * 60 * 24));
+  const d1 = Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate());
+  const d2 = Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), end.getUTCDate());
+  const gapMs = d2 - d1;
+  if (gapMs <= 0) return 0;
+  // Use ceiling so any fraction of a day or different calendar day counts as at least 1
+  return Math.ceil(gapMs / (1000 * 60 * 60 * 24));
 }
 
 function diffDaysAbs(a: Date | null, b: Date | null): number {
   if (!a || !b) return 0;
-  const aUtc = Date.UTC(a.getUTCFullYear(), a.getUTCMonth(), a.getUTCDate());
-  const bUtc = Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate());
-  return Math.round(Math.abs(bUtc - aUtc) / (1000 * 60 * 60 * 24));
+  const d1 = Date.UTC(a.getUTCFullYear(), a.getUTCMonth(), a.getUTCDate());
+  const d2 = Date.UTC(b.getUTCFullYear(), b.getUTCMonth(), b.getUTCDate());
+  const gapMs = Math.abs(d2 - d1);
+  if (gapMs === 0) return 0;
+  return Math.max(1, Math.ceil(gapMs / (1000 * 60 * 60 * 24)));
 }
 
 function utcDateOnlyMs(value: Date): number {
   return Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate());
+}
+
+
+
+// NWR LOOPS 
+function calculateNwrLoops(
+  sorted: Array<{
+    designationNorm: string;
+    designationRaw: string;
+    department: string;
+    at: Date;
+  }>
+) {
+  const relevant = sorted.filter(
+    (x) =>
+      (x.department === "NWR" ||
+        x.designationRaw.toUpperCase().includes("/NWR")) &&
+      (
+        x.designationNorm === "CEPD" ||
+        x.designationRaw.toUpperCase().includes("FA")
+      )
+  );
+
+  const totalCepd = relevant.filter(
+    (x) => x.designationNorm === "CEPD"
+  ).length;
+
+  // Rule: if CEPD <= 1 → ignore
+  if (totalCepd <= 1) return [];
+
+  let loops: {
+    cepdDate: string;
+    faDate: string;
+    delayDays: number;
+  }[] = [];
+
+  let currentCepd: Date | null = null;
+
+  for (const row of relevant) {
+    const isCepd = row.designationNorm === "CEPD";
+    const isFa = row.designationRaw.toUpperCase().includes("FA");
+
+    if (isCepd) {
+      currentCepd = row.at; // overwrite latest
+    }
+
+    if (isFa && currentCepd) {
+      const delayDays = diffDays(currentCepd, row.at);
+
+      loops.push({
+        cepdDate: currentCepd.toISOString(),
+        faDate: row.at.toISOString(),
+        delayDays,
+      });
+
+      currentCepd = null; // reset after pairing
+    }
+  }
+
+  return loops;
 }
 
 export function calculateBucketDelay(
@@ -134,13 +193,13 @@ export function calculateBucketDelay(
       };
     })
     .filter((x) => x.at !== null) as Array<{
-    raw: DelayInputItem;
-    designationRaw: string;
-    designationNorm: string;
-    department: string;
-    sequenceNo: number;
-    at: Date;
-  }>;
+      raw: DelayInputItem;
+      designationRaw: string;
+      designationNorm: string;
+      department: string;
+      sequenceNo: number;
+      at: Date;
+    }>;
 
   if (!normalized.length) {
     return {
@@ -166,6 +225,8 @@ export function calculateBucketDelay(
     return a.at.getTime() - b.at.getTime();
   });
 
+  //  NWR LOOPS
+  const nwrLoops = calculateNwrLoops(sorted);
   const firstSequenceNo = sorted[0].sequenceNo || 0;
   const lastSequenceNo = sorted[sorted.length - 1].sequenceNo || 0;
 
@@ -184,28 +245,48 @@ export function calculateBucketDelay(
 
   const drmLastAt = drmRows.length ? drmRows[drmRows.length - 1].at : null;
   const srdfmLastAt = srdfmRows.length ? srdfmRows[srdfmRows.length - 1].at : null;
-  const nwrBeforeLastRows = sorted.filter((x) => {
-    const isNwr =
-      x.department === "NWR" || x.designationRaw.toUpperCase().includes("/NWR");
-    const isBeforeLast = (x.sequenceNo || 0) < lastSequenceNo;
-    const isBeforeLastDate = utcDateOnlyMs(x.at) < utcDateOnlyMs(lastDesignation);
-    return isNwr && isBeforeLast && isBeforeLastDate;
+  // CHANGED: Specific logic for CEPD/NWR (taking the last time he appears)
+  const cepdRows = sorted.filter((x) => {
+    const isCepd = x.designationNorm === "CEPD" || x.designationRaw.toUpperCase().includes("CEPD/NWR");
+    const isNwr = x.department === "NWR" || x.designationRaw.toUpperCase().includes("/NWR");
+    return isCepd && isNwr;
   });
-  const nwrBeforeLastAt = nwrBeforeLastRows.length
-    ? nwrBeforeLastRows[nwrBeforeLastRows.length - 1].at
+
+  const nwrBeforeLastAt = cepdRows.length
+    ? cepdRows[cepdRows.length - 1].at // Strictly take the LAST time CEPD appeared
     : null;
+
+  // Fallback to general NWR only if CEPD is not found at all
+  if (!nwrBeforeLastAt) {
+    const nwrRowsFallback = sorted.filter((x) => {
+      const isNwr = x.department === "NWR" || x.designationRaw.toUpperCase().includes("/NWR");
+      const isBeforeLast = (x.sequenceNo || 0) < lastSequenceNo;
+      return isNwr && isBeforeLast;
+    });
+    if (nwrRowsFallback.length) {
+      (nwrBeforeLastAt as any) = nwrRowsFallback[nwrRowsFallback.length - 1].at;
+    }
+  }
 
   return {
     totalCycleDays: diffDays(firstDesignation, lastDesignation),
-    executiveDelayDays: diffDays(gmApprovalAt, firstDesignation),
-    financeDelayDays: diffDaysAbs(drmLastAt, srdfmLastAt),
-    hqDelayDays: diffDays(nwrBeforeLastAt, lastDesignation),
+    executiveDelayDays: diffDaysAbs(firstDesignation, gmApprovalAt), // Restored for Averaging
+    financeDelayDays: diffDaysAbs(drmLastAt, srdfmLastAt),          // Restored for Averaging
+    hqDelayDays: diffDays(nwrBeforeLastAt, lastDesignation),         // Restored for Averaging
+    // NWR LOOPS
+    nwrLoops,
+    nwrLoopCount: nwrLoops.length,
     markers: {
       firstDesignationAt: firstDesignation.toISOString(),
+      firstDesignationDate: `${String(firstDesignation.getUTCDate()).padStart(2, '0')}/${String(firstDesignation.getUTCMonth() + 1).padStart(2, '0')}/${firstDesignation.getUTCFullYear()}`,
       lastDesignationAt: lastDesignation.toISOString(),
+      lastDesignationDate: `${String(lastDesignation.getUTCDate()).padStart(2, '0')}/${String(lastDesignation.getUTCMonth() + 1).padStart(2, '0')}/${lastDesignation.getUTCFullYear()}`,
       gmApprovalAt: gmApprovalAt ? gmApprovalAt.toISOString() : null,
+      gmApprovalDateFormatted: gmApprovalAt ? `${String(gmApprovalAt.getUTCDate()).padStart(2, '0')}/${String(gmApprovalAt.getUTCMonth() + 1).padStart(2, '0')}/${gmApprovalAt.getUTCFullYear()}` : null,
       drmLastAt: drmLastAt ? drmLastAt.toISOString() : null,
+      drmLastDate: drmLastAt ? `${String(drmLastAt.getUTCDate()).padStart(2, '0')}/${String(drmLastAt.getUTCMonth() + 1).padStart(2, '0')}/${drmLastAt.getUTCFullYear()}` : null,
       srdfmLastAt: srdfmLastAt ? srdfmLastAt.toISOString() : null,
+      srdfmLastDate: srdfmLastAt ? `${String(srdfmLastAt.getUTCDate()).padStart(2, '0')}/${String(srdfmLastAt.getUTCMonth() + 1).padStart(2, '0')}/${srdfmLastAt.getUTCFullYear()}` : null,
       nwrBeforeLastAt: nwrBeforeLastAt ? nwrBeforeLastAt.toISOString() : null,
     },
   };

@@ -27,12 +27,13 @@ export async function getGpt4oResponse(prompt: string, data: any) {
       model: azureOpenAIDeployment, // Must match deployment name in Azure
       response_format: {
         type: "json_object", // Specify the response format
-      }, // Specify the response format
+      },
+      max_tokens: 16384, // Very high limit for large tables with 50+ rows
       messages: [
         { role: "system", content: prompt },
         { role: "user", content: JSON.stringify(data) },
       ],
-    });
+    }, { timeout: 300000 }); // 5 minute timeout for very large documents
 
     return JSON.parse(response.choices[0].message.content); // or response.choices[0].message.content if you want just the reply
   } catch (error: any) {

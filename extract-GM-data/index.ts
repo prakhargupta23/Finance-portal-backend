@@ -1,7 +1,7 @@
 import { AzureFunction, Context, HttpRequest } from "@azure/functions";
 import { GmOcrError, getGMFileData } from "../src/service/gmdocdata.service";
 import { persistGmData } from "../src/service/gmvetting.service";
-
+import DocumentMaster from "../src/Model/DocumentMaster.model";
 const httpTrigger: AzureFunction = async function (
   context: Context,
   req: HttpRequest
@@ -9,7 +9,7 @@ const httpTrigger: AzureFunction = async function (
   const traceId = `gm-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   try {
-    const { fileBase64, rowId } = req.body || {};
+    const { fileBase64, rowId, sNo, masterId, fileName, fileUrl, docLabel } = req.body || {};
 
     console.log(`[${traceId}] GM extract request received`, {
       hasFileBase64: Boolean(fileBase64),
@@ -37,11 +37,48 @@ const httpTrigger: AzureFunction = async function (
     });
 
     console.log(`[${traceId}] Persisting GM data to DB`);
-    const dbWrite = await persistGmData(processedData);
+    let targetSNo = sNo || masterId;
+
+    if (!targetSNo) {
+      const fallbackSNo = Math.floor(100000000 + Math.random() * 900000000).toString();
+      console.log(`[${traceId}] No masterId provided, creating fallback master with S.No: ${fallbackSNo}`);
+      const master = await DocumentMaster.create({
+        s_no: fallbackSNo,
+      }) as any;
+      targetSNo = master.s_no;
+    }
+
+    // Update DocumentMaster with upload status
+    if (docLabel && targetSNo) {
+      const updateMap: any = {
+        "DRM APP": { drm_app_uploaded: true, drm_app_file_url: fileUrl, drm_app_file_name: fileName },
+        "D&G Letter": { dg_letter_uploaded: true, dg_letter_file_url: fileUrl, dg_letter_file_name: fileName },
+        "Estimate reference": { estimate_uploaded: true, estimate_file_url: fileUrl, estimate_file_name: fileName },
+        "Func distribution letter": { func_distribution_uploaded: true, func_distribution_file_url: fileUrl, func_distribution_file_name: fileName },
+        "Top sheet": { top_sheet_uploaded: true, top_sheet_file_url: fileUrl, top_sheet_file_name: fileName }
+      };
+
+      const updateData = updateMap[docLabel];
+      if (updateData) {
+        console.log(`[${traceId}] Attempting DocumentMaster status update for GM ${docLabel} (S.No: ${targetSNo})`, updateData);
+        const [updatedRows] = await DocumentMaster.update(updateData, { where: { s_no: targetSNo } });
+        console.log(`[${traceId}] Update result: ${updatedRows} row(s) updated.`);
+
+        if (updatedRows === 0) {
+          console.log(`[${traceId}] WARNING: No record found with S.No ${targetSNo}. Creating a new one to ensure status persistence.`);
+          await DocumentMaster.create({
+            s_no: targetSNo,
+            ...updateData
+          });
+        }
+      }
+    }
+
+    const dbWrite = await persistGmData(processedData, targetSNo, fileName, fileUrl);
     console.log(`[${traceId}] DB write result`, dbWrite);
 
     context.res = {
-      status: 200,
+      status: dbWrite.saved ? 200 : 409,
       body: {
         traceId,
         ...processedData,

@@ -1,5 +1,7 @@
-import GmApprovalData from "../Model/GmApprovalData.models";
+import GmApprovalData from "../Model/GmApprovalData.model";
 import sequelize from "../config/sequelize";
+import { Op } from "sequelize";
+import { normalizeText, normalizePlanhead } from "./vetting.service";
 
 export type GmDbWriteResult = {
   saved: boolean;
@@ -36,19 +38,23 @@ function extractHeaderGmDate(rawText: string | null | undefined): string | null 
   const text = String(rawText || "");
   if (!text.trim()) return null;
 
-  // Common format in letters:
-  // Headquarters Office
-  // Jaipur
-  // Date-30.10.2025
+  // Pattern 1: Look for date after Hq/Headquarters, Sub, or Ref
+  // Allows for optional separators: "Date16.12.2024", "Date: 16-12-24", etc.
+  // We scan up to 200 characters after these headers for a date.
   const hqPattern =
-    /headquarters\s*office[\s\S]{0,120}?date\s*[-:]\s*([0-3]?\d[\/.-][01]?\d[\/.-]\d{2,4})/i;
+    /(?:head\s*quarter(?:s)?|hq|sub|ref)\s*[:.\s\w]{0,200}?\bdate[rd]?\s*[-:\s.]*\s*([0-3]?\d[\/.-][01]?\d[\/.-]\d{2,4})/i;
   const hqMatch = text.match(hqPattern);
   if (hqMatch?.[1]) return hqMatch[1];
 
-  // Generic fallback for lines like "Date-30.10.2025"
-  const dateLinePattern = /\bdate\s*[-:]\s*([0-3]?\d[\/.-][01]?\d[\/.-]\d{2,4})\b/i;
-  const dateLineMatch = text.match(dateLinePattern);
-  if (dateLineMatch?.[1]) return dateLineMatch[1];
+  // Pattern 2: Look specifically for "Dated" or "Date" anywhere in the text (first 600 chars)
+  const datePattern = /\bdate[rd]?\s*[-:\s.]*\s*([0-3]?\d[\/.-][01]?\d[\/.-]\d{2,4})/i;
+  const dateMatch = text.substring(0, 600).match(datePattern);
+  if (dateMatch?.[1]) return dateMatch[1];
+
+  // Pattern 3: Final fallback - just grab the first date-like thing found in the header
+  const anyDatePattern = /\b([0-3]?\d[\/.-][01]?\d[\/.-]\d{2,4})\b/;
+  const anyDateMatch = text.substring(0, 400).match(anyDatePattern);
+  if (anyDateMatch?.[1]) return anyDateMatch[1];
 
   return null;
 }
@@ -80,7 +86,10 @@ function toSqlTime(timeValue: string | null | undefined): string | null {
 }
 
 export async function persistGmData(
-  processedData: any
+  processedData: any,
+  sNo: string,
+  fileName?: string | null,
+  fileUrl?: string | null
 ): Promise<GmDbWriteResult> {
   console.log("[GM][DB] Persisting GM data to database...");
 
@@ -100,47 +109,113 @@ export async function persistGmData(
 
     const gmFlow = Array.isArray(processedData?.right_side_flow)
       ? processedData.right_side_flow.find((item: any) =>
-          String(item?.designation || "").toLowerCase().includes("gm")
-        )
+        String(item?.designation || "").toLowerCase().includes("gm")
+      )
       : null;
 
     const headerDateRaw = extractHeaderGmDate(processedData?.raw_text);
     const gmDateRaw =
-      gmFlow?.date ?? processedData?.gm_approval_date ?? headerDateRaw ?? null;
+      headerDateRaw ?? gmFlow?.date ?? processedData?.gm_approval_date ?? null;
     const gmTimeRaw = gmFlow?.time ?? null;
     const gmDate = toSqlDate(gmDateRaw);
     const gmTime = toSqlTime(gmTimeRaw);
 
-    console.log("[GM][DB] GM flow match", {
-      found: Boolean(gmFlow),
-      headerDateRaw,
-      gmDateRaw,
-      gmTimeRaw,
-      gmDate,
-      gmTime,
-      designation: gmFlow?.designation ?? null,
+    const worksToInsert = Array.isArray(processedData?.works) && processedData.works.length > 0
+      ? processedData.works
+      : [
+        {
+          work_name: processedData?.work_name || processedData?.workname,
+          division: processedData?.division,
+          allocation: processedData?.allocation,
+          sanctioned_cost: processedData?.sanctioned_cost,
+          executing_agency: processedData?.executing_agency
+        }
+      ];
+
+    // DUPLICATE CHECK APPLIED
+    // << CHANGE: Replaced local normalize with imported normalizeText and normalizePlanhead >>
+    const currentWorkNameNorm = normalizeText(worksToInsert[0]?.work_name || worksToInsert[0]?.workname);
+    const currentPHNorm = normalizePlanhead(processedData?.plan_head);
+
+    console.log("[GM][DB] Global Duplicate Check Start", {
+      ph: currentPHNorm,
+      work: currentWorkNameNorm.substring(0, 50) + "..."
     });
 
-    const createdRow: any = await GmApprovalData.create(
-      {
+    // << REPLACE LOGIC START (HARD RESET) >>
+    // REASON: Deep Search for old GM records.
+    const existingWithSameSNo = await GmApprovalData.findAll({
+      where: {
+        [Op.or]: [
+          { s_no: sNo },
+          { s_no: sNo.trim() },
+          sequelize.where(sequelize.fn('TRIM', sequelize.col('s_no')), sNo.trim())
+        ]
+      },
+      transaction
+    });
+
+    if (existingWithSameSNo.length > 0) {
+      console.log(`[GM][DB] Hard Reset Triggered for S.No: [${sNo}]. Purging ${existingWithSameSNo.length} old GM record(s)...`);
+      await GmApprovalData.destroy({
+        where: { uuid: { [Op.in]: existingWithSameSNo.map((e: any) => e.uuid) } },
+        transaction
+      });
+      console.log(`[GM][DB] Deep Clean Success.`);
+    }
+
+    // DUPLICATE CHECK: Only block if the work exists on a DIFFERENT S.No
+    const duplicateOnOtherSNo = await GmApprovalData.findOne({
+      where: {
+        [Op.and]: [
+          sequelize.where(sequelize.fn('LOWER', sequelize.col('planhead')), currentPHNorm),
+          sequelize.where(sequelize.fn('LOWER', sequelize.col('workname')), currentWorkNameNorm),
+          { s_no: { [Op.ne]: sNo } } // Ignore current session
+        ]
+      },
+      transaction
+    });
+
+    if (duplicateOnOtherSNo) {
+      console.log("[GM][DB] Duplicate detected on a different S.No! Stopping save.");
+      await transaction.rollback();
+      return {
+        saved: false,
+        error: "DUPLICATE_DOCUMENT: This Plan Head and Work Name already exists in another session."
+      };
+    }
+    // << REPLACE LOGIC END >>
+
+    console.log("[GM][DB] Final works to insert", { count: worksToInsert.length });
+
+    const createdRows = await GmApprovalData.bulkCreate(
+      worksToInsert.map((w: any) => ({
+        s_no: sNo,
         planhead: processedData?.plan_head ?? null,
-        workname: processedData?.work_name ?? null,
+        letter_no: processedData?.letter_no ?? null,
+        subject: processedData?.subject ?? null,
+        reference: processedData?.reference ?? null,
+        workname: w?.work_name ?? null,
+        division: w?.division ?? null,
+        allocation: w?.allocation ?? null,
+        sanctioned_cost: w?.sanctioned_cost ?? null,
+        executing_agency: w?.executing_agency ?? null,
         gmApprovalDate: gmDate,
         gmApprovalTime: gmTime,
         rawText: processedData?.raw_text ?? null,
-      },
+      })),
       { transaction }
     );
 
     await transaction.commit();
 
     console.log("[GM][DB] GM data saved successfully", {
-      caseUuid: createdRow?.uuid ?? null,
+      insertedCount: createdRows.length,
     });
 
     return {
       saved: true,
-      caseUuid: createdRow?.uuid ?? undefined,
+      caseUuid: (createdRows[0] as any)?.uuid ?? undefined,
       gmApprovalDate: gmDate,
       gmApprovalTime: gmTime,
     };

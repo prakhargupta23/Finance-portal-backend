@@ -1,6 +1,7 @@
 import WorkVettingDesignationFlow from "../Model/WorkVettingDesignationFlow.model";
 import WorkVettingDesignationFlowItem from "../Model/WorkVettingDesignationFlowItem.model";
-import GmApprovalData from "../Model/GmApprovalData.models";
+import GmApprovalData from "../Model/GmApprovalData.model";
+import DocumentMaster from "../Model/DocumentMaster.model";
 import sequelize from "../config/sequelize";
 import { calculateBucketDelay } from "./delay.service";
 import { Op } from "sequelize";
@@ -13,19 +14,60 @@ export type DbWriteResult = {
     error?: string;
 };
 
-function normalizePlanhead(value?: string | null): string {
-    return String(value || "")
-        .toUpperCase()
-        .replace(/[^A-Z0-9]/g, "");
-}
+// << ADVANCED NORMALIZATION START >>
+// Purpose: Strip common OCR 'junk' like markers, labels, and UI text 
+// that frequently gets accidentally extracted from the portal's UI/PDF headers.
+export function normalizeText(value?: string | null): string {
+    let raw = String(value || "").toUpperCase();
 
-function normalizeText(value?: string | null): string {
-    return String(value || "")
-        .toUpperCase()
+    // 1. Remove common UI/Header labels AND standard project prefixes
+    const junkPatterns = [
+        "VIEW FULL SCREEN",
+        "WORK NAME",
+        "PLAN HEAD",
+        "PROJECT NAME",
+        "PROPOSAL FOR",
+        "CONSTRUCTION OF",
+        "PROV OF",
+        "ESTIMATE FOR",
+        "BACK TO",
+        "SR NO",
+        "S.NO.",
+        "HEAD:",
+        "PH:",
+        "_"
+    ];
+
+    junkPatterns.forEach(pattern => {
+        raw = raw.split(pattern).join("");
+    });
+
+    // 2. Clean up characters and extra spaces
+    return raw
         .replace(/\s+/g, " ")
         .replace(/[^A-Z0-9 ]/g, "")
         .trim();
 }
+
+export function isPlanheadMatch(gmPh: string | null, targetPhNorm: string | null): boolean {
+    if (!targetPhNorm) return true;
+    if (!gmPh) return false;
+    const gmPhRaw = String(gmPh).toUpperCase();
+    const numbersInGm = (gmPhRaw.match(/\d+/g) || []) as string[];
+    return numbersInGm.includes(targetPhNorm);
+}
+
+export function normalizePlanhead(value?: string | null): string {
+    const raw = String(value || "").toUpperCase();
+
+    // Try to find the numeric part first (e.g., "PH-17" -> "17")
+    const match = raw.match(/\d+/);
+    if (match) return match[0];
+
+    // Fallback: strip everything except alphanumeric
+    return raw.replace(/[^0-9]/g, "");
+}
+// << ADVANCED NORMALIZATION END >>
 
 function extractPlanheadKey(value?: string | null): string {
     const raw = String(value || "").toUpperCase();
@@ -34,9 +76,36 @@ function extractPlanheadKey(value?: string | null): string {
     return `${m[1]}/${m[2]}`;
 }
 
+/**
+ * FUZZY MATCHING LOGIC:
+ * Compares two strings by breaking them into words and checking how many words they share.
+ * This handles differences like "HQ/Person" matching "HQ/Personnel dep."
+ */
+function calculateSimilarity(str1: string, str2: string): number {
+    const s1 = normalizeText(str1).split(" ").filter(w => w.length > 2);
+    const s2 = normalizeText(str2).split(" ").filter(w => w.length > 2);
+
+    if (s1.length === 0 || s2.length === 0) return 0;
+
+    let matches = 0;
+    const larger = s1.length >= s2.length ? s1 : s2;
+    const smaller = s1.length < s2.length ? s1 : s2;
+
+    for (const word of smaller) {
+        if (larger.some(lw => lw.includes(word) || word.includes(lw))) {
+            matches++;
+        }
+    }
+
+    return matches / smaller.length;
+}
+
 export async function persistVettingData(
     processedData: any,
-    flowWithMetadata: any[]
+    flowWithMetadata: any[],
+    sNo: string,
+    fileName?: string | null,
+    fileUrl?: string | null
 ): Promise<DbWriteResult> {
     console.log("[FIN][DB] Persisting vetting data to the database...");
     const transaction = await sequelize.transaction();
@@ -50,9 +119,63 @@ export async function persistVettingData(
                 : 0
         });
         const dataToInsert = {
+            s_no: sNo,
             planhead: processedData?.plan_head ?? null,
             workname: processedData?.work_name ?? null,
         };
+
+        // DUPLICATE CHECK APPLIED
+        const currentWorkNorm = normalizeText(dataToInsert.workname);
+        const currentPHNorm = normalizePlanhead(dataToInsert.planhead);
+
+        // << SMARTER PURGE START >>
+        // We only purge if the S.No matches AND the workname is similar (normalized).
+        // This allows multiple DIFFERENT works in the same session (S.No) to coexist!
+        const flowsInSession = await WorkVettingDesignationFlow.findAll({
+            where: {
+                [Op.or]: [
+                    { s_no: sNo },
+                    { s_no: sNo.trim() }
+                ]
+            },
+            transaction
+        });
+
+        const flowsToPurge = flowsInSession.filter((f: any) => normalizeText(f.workname) === currentWorkNorm);
+        // << SMARTER PURGE END >>
+
+        if (flowsToPurge.length > 0) {
+            console.log(`[FIN][DB] Hard Reset Triggered for S.No: [${sNo}]. Found ${flowsToPurge.length} existing record(s) to purge.`);
+            const flowUuids = flowsToPurge.map((f: any) => f.uuid);
+            await WorkVettingDesignationFlowItem.destroy({ where: { flowUuid: { [Op.in]: flowUuids } }, transaction });
+            await WorkVettingDesignationFlow.destroy({
+                where: { uuid: { [Op.in]: flowUuids } },
+                transaction
+            });
+            console.log(`[FIN][DB] Purge Success. Old records cleared.`);
+        }
+
+        // DUPLICATE CHECK: Only block if the work exists on a DIFFERENT S.No
+        const duplicateOnOtherSNo = await WorkVettingDesignationFlow.findOne({
+            where: {
+                [Op.and]: [
+                    sequelize.where(sequelize.fn('UPPER', sequelize.col('planhead')), currentPHNorm),
+                    sequelize.where(sequelize.fn('UPPER', sequelize.col('workname')), currentWorkNorm),
+                    { s_no: { [Op.ne]: sNo } } // Ignore the current session
+                ]
+            },
+            transaction
+        });
+
+        if (duplicateOnOtherSNo) {
+            console.log("[FIN][DB] Duplicate detected on a different S.No! Stopping save.");
+            await transaction.rollback();
+            return {
+                saved: false,
+                error: "DUPLICATE_DOCUMENT: This work item has already been uploaded in another session."
+            };
+        }
+        // << REPLACE LOGIC END >>
 
         const flowRow = await WorkVettingDesignationFlow.create(dataToInsert, { transaction });
         console.log("[FIN][DB] Header row inserted", { caseUuid: (flowRow as any).uuid });
@@ -63,7 +186,7 @@ export async function persistVettingData(
                     flowUuid: (flowRow as any).uuid,
                     sequenceNo: flow.sequenceNo,
                     designation: flow.designationCanonical,
-                    department: flow.department ?? null,                      
+                    department: flow.department ?? null,
                     actionDate: flow.actionDate,
                     actionTime: flow.actionTime,
                     isCurrentPending: false,
@@ -81,31 +204,38 @@ export async function persistVettingData(
             totalFlowRows: flowWithMetadata.length,
             matchedRows: flowWithMetadata.filter((x: any) => x.isMatchedTarget).length,
         };
-    } catch (Error: any) {
+    } catch (err: any) {
         await transaction.rollback();
-        console.error("[FIN][DB] Error Message:", Error);
+        console.error("[FIN][DB] Error Message:", err);
         console.error("[FIN][DB] Rolling back transaction...");
         return {
             saved: false,
-            error: Error?.message || "Failed to save vetting data",
+            error: err?.message || "Failed to save vetting data",
         };
     }
 }
 
 export async function getVettingData(): Promise<any> {
     try {
-        const flowData = await WorkVettingDesignationFlow.findAll({
+        const allFlows = await WorkVettingDesignationFlow.findAll({
             raw: true,
-        }); 
-        const designationflowData = await WorkVettingDesignationFlowItem.findAll({
-            raw: true,
-        }); 
-        const data = {
-            docdata: flowData,
-            flowdata: designationflowData
+        });
+
+        // 2. Smarter deduplication: use both S.No and normalized Workname.
+        // This stops ghost rows but allows multiple works in a single session!
+        const uniqueMap = new Map();
+        for (const item of allFlows) {
+            const key = `${(item as any).s_no}|${normalizeText((item as any).workname)}`;
+            if (!uniqueMap.has(key)) {
+                uniqueMap.set(key, item);
+            }
         }
-        console.log("Fetched vetting data from the database:", data);
-        return data;
+        const flowData = Array.from(uniqueMap.values());
+
+        return {
+            docdata: flowData,
+            flowdata: []
+        };
     } catch (error: any) {
         console.error("Error fetching vetting data:", error);
         throw new Error("Failed to fetch vetting data");
@@ -115,241 +245,256 @@ export async function getVettingData(): Promise<any> {
 export async function getAggregateDelayData(
     planhead?: string | null,
     workhead?: string | null,
+    sNo?: string | null,
     strictMatch: boolean = true
-): Promise<{
-    executiveDelayDays: number;
-    financeDelayDays: number;
-    hqDelayDays: number;
-    meta: {
-        requestedPlanhead: string | null;
-        requestedWorkhead: string | null;
-        selectedPlanhead: string | null;
-        selectedWorkhead: string | null;
-        matchStrategy: string | null;
-        flowUuid: string | null;
-        flowItemsCount: number;
-        gmMatched: boolean;
-        gmApprovalDate: string | null;
-        gmApprovalTime: string | null;
-        markers: any;
-    };
-}> {
+): Promise<any> {
     try {
         const requestedPlanhead = String(planhead || "").trim() || null;
-        const requestedWorkhead = String(workhead || "").trim() || null;
-        const requestedPlanheadNorm = normalizePlanhead(requestedPlanhead);
-        const requestedWorkheadNorm = normalizeText(requestedWorkhead);
-        const requestedPlanheadKey = extractPlanheadKey(requestedPlanhead);
+        const requestedWorkheadNorm = normalizeText(workhead);
 
-        let selectedFlow: any = null;
-        let matchStrategy: string | null = null;
+        const whereClause = requestedPlanhead ? { planhead: requestedPlanhead } : {};
+        const flows = await WorkVettingDesignationFlow.findAll({
+            where: whereClause,
+            raw: true
+        });
 
-        if (requestedPlanheadNorm || requestedWorkheadNorm) {
-            const flowCandidates: any[] = await WorkVettingDesignationFlow.findAll({
-                order: [["createdAt", "DESC"]],
-                limit: 1000,
-                raw: true,
-            });
-
-            selectedFlow =
-                flowCandidates.find((x: any) => {
-                    const planOk = requestedPlanheadNorm
-                        ? normalizePlanhead(x?.planhead) === requestedPlanheadNorm
-                        : true;
-                    const workOk = requestedWorkheadNorm
-                        ? normalizeText(x?.workname) === requestedWorkheadNorm
-                        : true;
-                    return planOk && workOk;
-                }) || null;
-            if (selectedFlow) {
-                if (requestedPlanheadNorm && requestedWorkheadNorm) {
-                    matchStrategy = "exact_planhead_and_workhead";
-                } else if (requestedPlanheadNorm) {
-                    matchStrategy = "exact_planhead";
-                } else if (requestedWorkheadNorm) {
-                    matchStrategy = "exact_workhead";
-                }
+        // 2. Smarter deduplication: use both S.No and normalized Workname.
+        const uniqueMap = new Map();
+        for (const item of flows) {
+            const key = `${(item as any).s_no}|${normalizeText((item as any).workname)}`;
+            if (!uniqueMap.has(key)) {
+                uniqueMap.set(key, item);
             }
-
-            if (!selectedFlow && requestedPlanheadNorm) {
-                selectedFlow =
-                    flowCandidates.find(
-                        (x: any) => normalizePlanhead(x?.planhead) === requestedPlanheadNorm
-                    ) || null;
-                if (selectedFlow) matchStrategy = "exact_planhead";
-            }
-
-            if (!selectedFlow && requestedWorkheadNorm) {
-                selectedFlow =
-                    flowCandidates.find(
-                        (x: any) => normalizeText(x?.workname) === requestedWorkheadNorm
-                    ) || null;
-                if (selectedFlow) matchStrategy = "exact_workhead";
-            }
-
-            if (!selectedFlow && requestedPlanheadNorm) {
-                selectedFlow =
-                    flowCandidates.find((x: any) => {
-                        const plan = normalizePlanhead(x?.planhead);
-                        return (
-                            plan.includes(requestedPlanheadNorm) ||
-                            requestedPlanheadNorm.includes(plan)
-                        );
-                    }) || null;
-                if (selectedFlow) matchStrategy = "partial_planhead";
-            }
-
-            if (!selectedFlow && requestedPlanheadKey) {
-                selectedFlow =
-                    flowCandidates.find((x: any) =>
-                        String(x?.planhead || "").toUpperCase().includes(requestedPlanheadKey)
-                    ) || null;
-                if (selectedFlow) matchStrategy = "planhead_key";
-            }
-        } else {
-            selectedFlow = await WorkVettingDesignationFlow.findOne({
-                order: [["createdAt", "DESC"]],
-                raw: true,
-            });
-            if (selectedFlow) matchStrategy = "latest_flow";
         }
+        const worksInPh = Array.from(uniqueMap.values());
 
-        if (!selectedFlow?.uuid) {
-            return {
-                executiveDelayDays: 0,
-                financeDelayDays: 0,
-                hqDelayDays: 0,
-                meta: {
-                    requestedPlanhead,
-                    requestedWorkhead,
-                    selectedPlanhead: null,
-                    selectedWorkhead: null,
-                    matchStrategy: strictMatch ? "strict_no_flow_match" : null,
-                    flowUuid: null,
-                    flowItemsCount: 0,
-                    gmMatched: false,
-                    gmApprovalDate: null,
-                    gmApprovalTime: null,
-                    markers: null,
-                },
-            };
-        }
+        if (worksInPh.length === 0) return null;
 
-        const flowItems = await WorkVettingDesignationFlowItem.findAll({
-            where: { flowUuid: selectedFlow.uuid },
-            order: [["sequenceNo", "ASC"]],
+        const isSingleWork = Boolean(requestedWorkheadNorm || sNo);
+        const gmWhere: any = { gmApprovalDate: { [Op.ne]: null } };
+        if (sNo) gmWhere.s_no = sNo;
+
+        const gmCandidates: any[] = await GmApprovalData.findAll({
+            where: gmWhere,
             raw: true,
         });
 
-        const flowPlanhead = String(selectedFlow.planhead || "").trim();
-        const flowWorkhead = String(selectedFlow.workname || "").trim();
-        const flowPlanheadNorm = normalizePlanhead(flowPlanhead);
-        const flowWorkheadNorm = normalizeText(flowWorkhead);
-        const flowPlanheadKey = extractPlanheadKey(flowPlanhead);
+        if (isSingleWork) {
+            const target = worksInPh.find(x => {
+                const masterMatch = sNo ? String((x as any).s_no) === String(sNo) : true;
+                const nameMatch = requestedWorkheadNorm ? normalizeText((x as any).workname) === requestedWorkheadNorm : true;
+                return masterMatch && nameMatch;
+            }) || worksInPh[0];
 
-        let matchedGmApproval: any = null;
-        if (flowPlanhead || flowWorkhead) {
-            const gmCandidates: any[] = await GmApprovalData.findAll({
-                where: {
-                    gmApprovalDate: {
-                        [Op.ne]: null,
-                    },
-                },
-                order: [
-                    ["createdAt", "DESC"],
-                    ["gmApprovalDate", "DESC"],
-                    ["gmApprovalTime", "DESC"],
-                ],
-                limit: 500,
+            const flowItems = await WorkVettingDesignationFlowItem.findAll({
+                where: { flowUuid: (target as any).uuid },
+                order: [["sequenceNo", "ASC"]],
                 raw: true,
             });
 
-            matchedGmApproval =
-                gmCandidates.find((x: any) => {
-                    const planOk = flowPlanheadNorm
-                        ? normalizePlanhead(x?.planhead) === flowPlanheadNorm
-                        : true;
-                    const workOk = flowWorkheadNorm
-                        ? normalizeText(x?.workname) === flowWorkheadNorm
-                        : true;
-                    return planOk && workOk;
-                }) || null;
+            const targetWorknameNorm = normalizeText((target as any).workname);
+            const targetPHNorm = normalizePlanhead((target as any).planhead);
 
-            if (!matchedGmApproval && flowPlanheadNorm) {
-                matchedGmApproval =
-                    gmCandidates.find(
-                        (x: any) => normalizePlanhead(x?.planhead) === flowPlanheadNorm
-                    ) || null;
+            let matchedGm = gmCandidates.find(g =>
+                isPlanheadMatch(g.planhead, targetPHNorm) &&
+                normalizeText(g.workname) === targetWorknameNorm
+            );
+
+            if (!matchedGm && targetWorknameNorm) {
+                let bestSim = 0;
+                for (const candidate of gmCandidates) {
+                    if (isPlanheadMatch(candidate.planhead, targetPHNorm)) {
+                        const sim = calculateSimilarity((target as any).workname, candidate?.workname || "");
+                        if (sim > 0.50 && sim > bestSim) {
+                            bestSim = sim;
+                            matchedGm = candidate;
+                        }
+                    }
+                }
             }
 
-            if (!matchedGmApproval && flowWorkheadNorm) {
-                matchedGmApproval =
-                    gmCandidates.find(
-                        (x: any) => normalizeText(x?.workname) === flowWorkheadNorm
-                    ) || null;
+            const delays = calculateBucketDelay(
+                flowItems as any[],
+                matchedGm?.gmApprovalDate ?? null,
+                matchedGm?.gmApprovalTime ?? null
+            );
+
+            return {
+                workname: (target as any).workname,
+                planhead: (target as any).planhead,
+                ...delays,
+                meta: {
+                    gmMatched: !!matchedGm,
+                    sanctioned_cost: matchedGm?.sanctioned_cost ?? null,
+                    division: matchedGm?.division ?? null,
+                    allocation: matchedGm?.allocation ?? null,
+                    executing_agency: matchedGm?.executing_agency ?? null,
+                    gmApprovalDate: matchedGm?.gmApprovalDate ?? null
+                }
+            };
+        }
+
+        // AVERAGE MODE
+        const workUuids = worksInPh.map((w: any) => w.uuid);
+        const allFlowItems = await WorkVettingDesignationFlowItem.findAll({
+            where: { flowUuid: { [Op.in]: workUuids } },
+            raw: true,
+        });
+
+        const flowMap = new Map<string, any[]>();
+        allFlowItems.forEach((item: any) => {
+            const list = flowMap.get(item.flowUuid) || [];
+            list.push(item);
+            flowMap.set(item.flowUuid, list);
+        });
+
+        const gmMap = new Map<string, any[]>();
+        for (const g of gmCandidates) {
+            const phKey = normalizePlanhead(g.planhead);
+            const list = gmMap.get(phKey) || [];
+            list.push(g);
+            gmMap.set(phKey, list);
+        }
+
+        let totalExec = 0, totalFin = 0, totalHq = 0;
+        let countExec = 0, countFin = 0, countHq = 0;
+        let totalCycleSum = 0;
+        let countCycle = 0;
+
+        for (const work of worksInPh) {
+            const flowItems = flowMap.get((work as any).uuid) || [];
+            if (flowItems.length === 0) continue;
+
+            const workNameNorm = normalizeText((work as any).workname);
+            const workPHNorm = normalizePlanhead((work as any).planhead);
+            const workSNo = (work as any).s_no;
+
+            const phCandidates = gmMap.get(workPHNorm) || [];
+
+            let matchedGm = phCandidates.find(g =>
+                (workSNo && String(g.s_no) === String(workSNo)) &&
+                normalizeText(g.workname) === workNameNorm
+            );
+
+            if (!matchedGm) {
+                matchedGm = phCandidates.find(g => normalizeText(g.workname) === workNameNorm);
             }
 
-            if (!matchedGmApproval && flowPlanheadNorm) {
-                matchedGmApproval =
-                    gmCandidates.find((x: any) => {
-                        const plan = normalizePlanhead(x?.planhead);
-                        return (
-                            plan.includes(flowPlanheadNorm) ||
-                            flowPlanheadNorm.includes(plan)
-                        );
-                    }) || null;
+            if (!matchedGm && workNameNorm) {
+                let bestSim = 0;
+                for (const candidate of phCandidates) {
+                    const sim = calculateSimilarity((work as any).workname, candidate?.workname || "");
+                    if (sim > 0.60 && sim > bestSim) {
+                        bestSim = sim;
+                        matchedGm = candidate;
+                    }
+                }
             }
 
-            if (!matchedGmApproval && flowPlanheadKey) {
-                matchedGmApproval =
-                    gmCandidates.find((x: any) =>
-                        String(x?.planhead || "").toUpperCase().includes(flowPlanheadKey)
-                    ) || null;
+            const delays = calculateBucketDelay(
+                flowItems,
+                matchedGm?.gmApprovalDate ?? null,
+                matchedGm?.gmApprovalTime ?? null
+            );
+
+            if (delays.markers.gmApprovalAt && delays.markers.firstDesignationAt) {
+                totalExec += (delays.executiveDelayDays || 0);
+                countExec++;
+            }
+            if (delays.markers.drmLastAt && delays.markers.srdfmLastAt) {
+                totalFin += (delays.financeDelayDays || 0);
+                countFin++;
+            }
+            if (delays.markers.nwrBeforeLastAt && delays.markers.lastDesignationAt) {
+                totalHq += (delays.hqDelayDays || 0);
+                countHq++;
+            }
+            if (delays.markers.firstDesignationAt && delays.markers.lastDesignationAt) {
+                totalCycleSum += (delays.totalCycleDays || 0);
+                countCycle++;
             }
         }
 
-        if (!matchedGmApproval && !requestedPlanheadNorm && !requestedWorkheadNorm && !strictMatch) {
-            matchedGmApproval = await GmApprovalData.findOne({
-                where: {
-                    gmApprovalDate: {
-                        [Op.ne]: null,
-                    },
-                },
-                order: [
-                    ["createdAt", "DESC"],
-                    ["gmApprovalDate", "DESC"],
-                    ["gmApprovalTime", "DESC"],
-                ],
-                raw: true,
-            });
-        }
-
-        const delays = calculateBucketDelay(
-            flowItems as any[],
-            matchedGmApproval?.gmApprovalDate ?? null,
-            matchedGmApproval?.gmApprovalTime ?? null
-        );
+        const avgExec = countExec > 0 ? Math.round(totalExec / countExec) : 0;
+        const avgFin = countFin > 0 ? Math.round(totalFin / countFin) : 0;
+        const avgHq = countHq > 0 ? Math.round(totalHq / countHq) : 0;
+        const avgTotalCycle = countCycle > 0 ? Math.round(totalCycleSum / countCycle) : (avgExec + avgFin + avgHq);
 
         return {
-            executiveDelayDays: delays.executiveDelayDays ?? 0,
-            financeDelayDays: delays.financeDelayDays ?? 0,
-            hqDelayDays: delays.hqDelayDays ?? 0,
+            workname: "Averages for " + (requestedPlanhead || "All"),
+            planhead: requestedPlanhead,
+            totalWorks: worksInPh.length,
+            totalCycleDays: avgTotalCycle,
+            executiveDelayDays: avgExec,
+            financeDelayDays: avgFin,
+            hqDelayDays: avgHq,
             meta: {
-                requestedPlanhead,
-                requestedWorkhead,
-                selectedPlanhead: flowPlanhead || null,
-                selectedWorkhead: flowWorkhead || null,
-                matchStrategy,
-                flowUuid: selectedFlow.uuid || null,
-                flowItemsCount: flowItems.length,
-                gmMatched: Boolean(matchedGmApproval?.gmApprovalDate),
-                gmApprovalDate: matchedGmApproval?.gmApprovalDate ?? null,
-                gmApprovalTime: matchedGmApproval?.gmApprovalTime ?? null,
-                markers: delays?.markers ?? null,
-            },
+                aggregated: true,
+                divisor: worksInPh.length,
+                counts: { exec: countExec, fin: countFin, hq: countHq, total: countCycle }
+            }
+        };
+
+    } catch (error: any) {
+        console.error("Aggregation failed", error);
+        throw new Error("Failed to process delay data");
+    }
+}
+
+export async function getTableData(): Promise<any> {
+    try {
+        const masters = await DocumentMaster.findAll({
+            include: [
+                { model: GmApprovalData, as: "gmData" },
+                { model: WorkVettingDesignationFlow, as: "flowData" }
+            ],
+            order: [["createdAt", "DESC"]]
+        });
+        const results = masters.map((master: any) => {
+            const data = master.toJSON() as any;
+            const required = ['drm_app_uploaded', 'dg_letter_uploaded', 'estimate_uploaded', 'func_distribution_uploaded', 'top_sheet_uploaded'];
+            const uploadedCount = required.filter(key => data[key]).length;
+            return {
+                ...data,
+                isReadyForVetting: uploadedCount === required.length,
+                completionCount: `${uploadedCount}/${required.length}`
+            };
+        });
+        return results;
+    } catch (error: any) {
+        console.error("Error in getTableData service:", error);
+        throw new Error("Failed to fetch table data");
+    }
+}
+
+export async function getMasterStatus(sNo: string): Promise<any> {
+    try {
+        const master = await DocumentMaster.findByPk(sNo);
+        if (!master) return null;
+
+        const data = master.toJSON() as any;
+        const required = ['drm_app_uploaded', 'dg_letter_uploaded', 'estimate_uploaded', 'func_distribution_uploaded', 'top_sheet_uploaded'];
+        const uploadedCount = required.filter(key => data[key]).length;
+
+        return {
+            ...data,
+            isReadyForVetting: uploadedCount === required.length,
+            completionCount: `${uploadedCount}/${required.length}`
         };
     } catch (error: any) {
-        console.error("Error fetching aggregate delay data:", error);
-        throw new Error("Failed to fetch aggregate delay data");
+        console.error("Error in getMasterStatus:", error);
+        throw new Error("Failed to fetch master status");
+    }
+}
+
+export async function getLatestMaster(): Promise<any> {
+    try {
+        const master = await DocumentMaster.findOne({
+            order: [["createdAt", "DESC"]]
+        });
+        return master;
+    } catch (error: any) {
+        console.error("Error in getLatestMaster:", error);
+        throw new Error("Failed to fetch latest master");
     }
 }
