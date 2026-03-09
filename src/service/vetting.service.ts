@@ -217,23 +217,27 @@ export async function persistVettingData(
 
 export async function getVettingData(): Promise<any> {
     try {
-        const allFlows = await WorkVettingDesignationFlow.findAll({
-            raw: true,
+        console.log("[FIN][DB] Fetching unique vetting data using DB-level optimization...");
+
+        // Use DB-level grouping to avoid fetching 500k rows
+        const uniqueWorks = await WorkVettingDesignationFlow.findAll({
+            attributes: [
+                's_no',
+                'planhead',
+                'workname',
+                [sequelize.fn('MAX', sequelize.col('uuid')), 'uuid'],
+                [sequelize.fn('MAX', sequelize.col('createdAt')), 'createdAt']
+            ],
+            group: ['s_no', 'planhead', 'workname'],
+            order: [[sequelize.fn('MAX', sequelize.col('createdAt')), 'DESC']],
+            limit: 5000, // Safety limit for dashboard
+            raw: true
         });
 
-        // 2. Smarter deduplication: use both S.No and normalized Workname.
-        // This stops ghost rows but allows multiple works in a single session!
-        const uniqueMap = new Map();
-        for (const item of allFlows) {
-            const key = `${(item as any).s_no}|${normalizeText((item as any).workname)}`;
-            if (!uniqueMap.has(key)) {
-                uniqueMap.set(key, item);
-            }
-        }
-        const flowData = Array.from(uniqueMap.values());
+        console.log(`[FIN][DB] Successfully fetched ${uniqueWorks.length} unique work items.`);
 
         return {
-            docdata: flowData,
+            docdata: uniqueWorks,
             flowdata: []
         };
     } catch (error: any) {
@@ -252,30 +256,25 @@ export async function getAggregateDelayData(
         const requestedPlanhead = String(planhead || "").trim() || null;
         const requestedWorkheadNorm = normalizeText(workhead);
 
+        // 1. Optimized Fetch: Only get works for the requested planhead
         const whereClause = requestedPlanhead ? { planhead: requestedPlanhead } : {};
-        const flows = await WorkVettingDesignationFlow.findAll({
+        const worksInPh = await WorkVettingDesignationFlow.findAll({
             where: whereClause,
+            attributes: ['uuid', 's_no', 'planhead', 'workname'],
+            group: ['uuid', 's_no', 'planhead', 'workname'],
             raw: true
         });
-
-        // 2. Smarter deduplication: use both S.No and normalized Workname.
-        const uniqueMap = new Map();
-        for (const item of flows) {
-            const key = `${(item as any).s_no}|${normalizeText((item as any).workname)}`;
-            if (!uniqueMap.has(key)) {
-                uniqueMap.set(key, item);
-            }
-        }
-        const worksInPh = Array.from(uniqueMap.values());
 
         if (worksInPh.length === 0) return null;
 
         const isSingleWork = Boolean(requestedWorkheadNorm || sNo);
         const gmWhere: any = { gmApprovalDate: { [Op.ne]: null } };
         if (sNo) gmWhere.s_no = sNo;
+        else if (requestedPlanhead) gmWhere.planhead = requestedPlanhead;
 
         const gmCandidates: any[] = await GmApprovalData.findAll({
             where: gmWhere,
+            attributes: ['s_no', 'planhead', 'workname', 'gmApprovalDate', 'gmApprovalTime', 'sanctioned_cost', 'division', 'allocation', 'executing_agency'],
             raw: true,
         });
 
@@ -288,6 +287,7 @@ export async function getAggregateDelayData(
 
             const flowItems = await WorkVettingDesignationFlowItem.findAll({
                 where: { flowUuid: (target as any).uuid },
+                attributes: ['designation', 'department', 'actionDate', 'actionTime', 'sequenceNo'],
                 order: [["sequenceNo", "ASC"]],
                 raw: true,
             });
@@ -334,12 +334,22 @@ export async function getAggregateDelayData(
             };
         }
 
-        // AVERAGE MODE
+        // AVERAGE MODE: Optimized with limit and count safety
+        console.log(`[FIN][DELAY] Aggregating ${worksInPh.length} works...`);
         const workUuids = worksInPh.map((w: any) => w.uuid);
-        const allFlowItems = await WorkVettingDesignationFlowItem.findAll({
-            where: { flowUuid: { [Op.in]: workUuids } },
-            raw: true,
-        });
+
+        // Split into chunks if there are too many UUIDs to avoid "SQL string too long" errors
+        const CHUNK_SIZE = 1000;
+        let allFlowItems: any[] = [];
+        for (let i = 0; i < workUuids.length; i += CHUNK_SIZE) {
+            const chunk = workUuids.slice(i, i + CHUNK_SIZE);
+            const items = await WorkVettingDesignationFlowItem.findAll({
+                where: { flowUuid: { [Op.in]: chunk } },
+                attributes: ['flowUuid', 'designation', 'department', 'actionDate', 'actionTime', 'sequenceNo'],
+                raw: true,
+            });
+            allFlowItems = allFlowItems.concat(items);
+        }
 
         const flowMap = new Map<string, any[]>();
         allFlowItems.forEach((item: any) => {
@@ -441,16 +451,27 @@ export async function getAggregateDelayData(
     }
 }
 
-export async function getTableData(): Promise<any> {
+export async function getTableData(cursor?: string | null, limitStr?: string): Promise<any> {
     try {
-        const masters = await DocumentMaster.findAll({
-            include: [
-                { model: GmApprovalData, as: "gmData" },
-                { model: WorkVettingDesignationFlow, as: "flowData" }
-            ],
-            order: [["createdAt", "DESC"]]
+        const limit = Math.max(1, parseInt(limitStr || "10"));
+
+        const whereClause: any = {};
+        if (cursor) {
+            // Use createdAt as the cursor for descending order
+            whereClause.createdAt = { [Op.lt]: new Date(cursor) };
+        }
+
+        console.log(`[DB] Querying DocumentMaster... limit=${limit}, cursor=${cursor || 'none'}`);
+
+        const { count, rows } = await DocumentMaster.findAndCountAll({
+            where: whereClause,
+            limit,
+            order: [["createdAt", "DESC"]],
         });
-        const results = masters.map((master: any) => {
+
+        console.log(`[DB] DocumentMaster results: count=${count}, rows=${rows.length}`);
+
+        const results = rows.map((master: any) => {
             const data = master.toJSON() as any;
             const required = ['drm_app_uploaded', 'dg_letter_uploaded', 'estimate_uploaded', 'func_distribution_uploaded', 'top_sheet_uploaded'];
             const uploadedCount = required.filter(key => data[key]).length;
@@ -460,7 +481,16 @@ export async function getTableData(): Promise<any> {
                 completionCount: `${uploadedCount}/${required.length}`
             };
         });
-        return results;
+
+        // The next cursor is the createdAt of the last element in the current result set
+        const nextCursor = results.length > 0 ? results[results.length - 1].createdAt : null;
+
+        return {
+            total: count,
+            limit,
+            nextCursor,
+            data: results
+        };
     } catch (error: any) {
         console.error("Error in getTableData service:", error);
         throw new Error("Failed to fetch table data");
