@@ -275,6 +275,12 @@ const GmApprovalData = sequelize.define(
   {
     tableName: "GmApprovalData",
     timestamps: true,
+    indexes: [
+      { fields: ["s_no"] },
+      { fields: ["planhead"] },
+      { fields: ["workname"] },
+      { fields: ["createdAt"] }
+    ]
   }
 );
 

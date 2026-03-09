@@ -34,8 +34,8 @@ const httpTrigger: AzureFunction = async function (
                 return;
             }
 
-            console.log(`[${traceId}] Fetching all master table data`);
-            const data = await getTableData();
+            console.log(`[${traceId}] Fetching master table data with cursor pagination:`, { cursor: req.query.cursor, limit: req.query.limit });
+            const data = await getTableData(req.query.cursor as string, req.query.limit as string);
             context.res = {
                 status: 200,
                 body: data

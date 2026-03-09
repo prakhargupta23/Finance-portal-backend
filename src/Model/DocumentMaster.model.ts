@@ -83,7 +83,11 @@ const DocumentMaster = sequelize.define(
     },
     {
         tableName: "DocumentMaster",
-        timestamps: true
+        timestamps: true,
+        indexes: [
+            { fields: ["s_no"] },
+            { fields: ["createdAt"] }
+        ]
     }
 );
 

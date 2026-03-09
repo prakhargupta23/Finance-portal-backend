@@ -76,6 +76,11 @@ const WorkVettingDesignationFlow = sequelize.define(
   {
     tableName: "WorkVettingDesignationFlows",
     timestamps: true,
+    indexes: [
+      { fields: ["s_no"] },
+      { fields: ["planhead"] },
+      { fields: ["createdAt"] }
+    ]
   }
 );
 
