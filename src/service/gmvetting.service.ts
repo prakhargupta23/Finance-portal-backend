@@ -11,6 +11,86 @@ export type GmDbWriteResult = {
   error?: string;
 };
 
+const MAX_RAW_TEXT_CHARS = 120000;
+const BULK_INSERT_BATCH_SIZE = 100;
+const MAX_VARCHAR_255 = 255;
+const GM_INSERT_FIELDS = [
+  "s_no",
+  "planhead",
+  "letter_no",
+  "subject",
+  "reference",
+  "workname",
+  "division",
+  "allocation",
+  "sanctioned_cost",
+  "executing_agency",
+  "gmApprovalDate",
+  "gmApprovalTime",
+  "rawText",
+] as const;
+
+function toDbString(value: any): string | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "string") {
+    const v = value.trim();
+    return v.length ? v : null;
+  }
+  if (Array.isArray(value)) {
+    const joined = value
+      .map((item) => (item === null || item === undefined ? "" : String(item).trim()))
+      .filter((item) => item.length > 0)
+      .join(" ");
+    return joined.length ? joined : null;
+  }
+  if (typeof value === "object") {
+    try {
+      const json = JSON.stringify(value);
+      return json === "{}" ? null : json;
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+function toDbVarchar(value: any, maxLen: number): string | null {
+  const normalized = toDbString(value);
+  if (!normalized) return null;
+  return normalized.length > maxLen ? normalized.slice(0, maxLen) : normalized;
+}
+
+function isNarrativeLike(value: string): boolean {
+  // Long sentence-like content usually means column mismatch from OCR/GPT.
+  return value.length > 120 || /[.;:]/.test(value) || value.split(" ").length > 16;
+}
+
+function normalizeDivision(value: any): string | null {
+  const v = toDbVarchar(value, 20);
+  if (!v) return null;
+  const compact = v.toUpperCase();
+  // Expected values are short codes like AII/BKN/JP/JU.
+  if (!/^[A-Z0-9&\-\/ ]{1,20}$/.test(compact)) return null;
+  if (compact.split(" ").length > 3) return null;
+  return compact;
+}
+
+function normalizeSanctionedCost(value: any): string | null {
+  const raw = toDbString(value);
+  if (!raw) return null;
+  const compact = raw.replace(/,/g, "").trim();
+  // Keep only simple numeric cost values; drop noisy text.
+  if (!/^\d+(\.\d+)?$/.test(compact)) return null;
+  return toDbVarchar(compact, MAX_VARCHAR_255);
+}
+
+function normalizeShortTextField(value: any): string | null {
+  const v = toDbVarchar(value, MAX_VARCHAR_255);
+  if (!v) return null;
+  if (isNarrativeLike(v)) return null;
+  return v;
+}
+
 function toSqlDate(dateValue: string | null | undefined): string | null {
   const raw = String(dateValue || "").trim();
   if (!raw || raw.toLowerCase() === "n/a") return null;
@@ -114,8 +194,16 @@ export async function persistGmData(
       : null;
 
     const headerDateRaw = extractHeaderGmDate(processedData?.raw_text);
-    const gmDateRaw =
-      headerDateRaw ?? gmFlow?.date ?? processedData?.gm_approval_date ?? null;
+    const gptDateRaw = processedData?.gm_approval_date;
+    const gmDateRaw = gptDateRaw || headerDateRaw || gmFlow?.date || null;
+
+    console.log("[GM][DB] Date resolution", {
+      gptDate: gptDateRaw,
+      regexHeaderDate: headerDateRaw,
+      flowDate: gmFlow?.date,
+      resolved: gmDateRaw
+    });
+
     const gmTimeRaw = gmFlow?.time ?? null;
     const gmDate = toSqlDate(gmDateRaw);
     const gmTime = toSqlTime(gmTimeRaw);
@@ -188,24 +276,75 @@ export async function persistGmData(
 
     console.log("[GM][DB] Final works to insert", { count: worksToInsert.length });
 
-    const createdRows = await GmApprovalData.bulkCreate(
-      worksToInsert.map((w: any) => ({
-        s_no: sNo,
-        planhead: processedData?.plan_head ?? null,
-        letter_no: processedData?.letter_no ?? null,
-        subject: processedData?.subject ?? null,
-        reference: processedData?.reference ?? null,
-        workname: w?.work_name ?? null,
-        division: w?.division ?? null,
-        allocation: w?.allocation ?? null,
-        sanctioned_cost: w?.sanctioned_cost ?? null,
-        executing_agency: w?.executing_agency ?? null,
-        gmApprovalDate: gmDate,
-        gmApprovalTime: gmTime,
-        rawText: processedData?.raw_text ?? null,
-      })),
-      { transaction }
-    );
+    const rawText = String(processedData?.raw_text || "");
+    const rawTextTrimmed = rawText.slice(0, MAX_RAW_TEXT_CHARS) || null;
+
+    if (rawText.length > MAX_RAW_TEXT_CHARS) {
+      console.warn("[GM][DB] raw_text truncated before DB insert", {
+        originalLength: rawText.length,
+        storedLength: MAX_RAW_TEXT_CHARS,
+      });
+    }
+
+    const rowsToInsert = worksToInsert.map((w: any, index: number) => ({
+      s_no: sNo,
+      planhead: toDbVarchar(processedData?.plan_head, MAX_VARCHAR_255),
+      letter_no: toDbVarchar(processedData?.letter_no, MAX_VARCHAR_255),
+      subject: toDbString(processedData?.subject),
+      reference: toDbString(processedData?.reference),
+      workname: toDbString(w?.work_name),
+      division: normalizeDivision(w?.division),
+      allocation: normalizeShortTextField(w?.allocation),
+      sanctioned_cost: normalizeSanctionedCost(w?.sanctioned_cost),
+      executing_agency: normalizeShortTextField(w?.executing_agency),
+      gmApprovalDate: gmDate,
+      gmApprovalTime: gmTime,
+      // Store heavy OCR text only once to prevent oversized SQL payloads.
+      rawText: index === 0 ? rawTextTrimmed : null,
+    }));
+
+    // Keep payload shape deterministic for MSSQL bulk inserts.
+    const normalizedRows = rowsToInsert.map((row) => ({
+      s_no: row.s_no ?? null,
+      planhead: row.planhead ?? null,
+      letter_no: row.letter_no ?? null,
+      subject: row.subject ?? null,
+      reference: row.reference ?? null,
+      workname: row.workname ?? null,
+      division: row.division ?? null,
+      allocation: row.allocation ?? null,
+      sanctioned_cost: row.sanctioned_cost ?? null,
+      executing_agency: row.executing_agency ?? null,
+      gmApprovalDate: row.gmApprovalDate ?? null,
+      gmApprovalTime: row.gmApprovalTime ?? null,
+      rawText: row.rawText ?? null,
+    }));
+
+    const createdRows: any[] = [];
+    for (let i = 0; i < normalizedRows.length; i += BULK_INSERT_BATCH_SIZE) {
+      const chunk = normalizedRows.slice(i, i + BULK_INSERT_BATCH_SIZE);
+      try {
+        const insertedChunk = await GmApprovalData.bulkCreate(chunk, {
+          transaction,
+          fields: [...GM_INSERT_FIELDS],
+        });
+        createdRows.push(...insertedChunk);
+      } catch (chunkError: any) {
+        console.warn("[GM][DB] Bulk chunk insert failed. Falling back to row inserts.", {
+          chunkStart: i,
+          chunkSize: chunk.length,
+          details: chunkError?.message,
+        });
+
+        for (const row of chunk) {
+          const created = await GmApprovalData.create(row as any, {
+            transaction,
+            fields: [...GM_INSERT_FIELDS],
+          });
+          createdRows.push(created);
+        }
+      }
+    }
 
     await transaction.commit();
 

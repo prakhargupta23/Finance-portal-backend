@@ -8,9 +8,19 @@ type DelayInputItem = {
   time?: string | null;
 };
 
-function parseDateTime(dateValue?: string | null, timeValue?: string | null): Date | null {
+function parseDateTime(dateValue?: any, timeValue?: string | null): Date | null {
+  if (dateValue instanceof Date) {
+    // If it's already a Date object, we just need to apply the time if provided
+    if (!timeValue) return dateValue;
+    const timeRaw = String(timeValue || "").trim();
+    const normalizedTime = normalizeTime(timeRaw) || "00:00:00";
+    const parts = normalizedTime.split(":");
+    dateValue.setUTCHours(Number(parts[0] || 0), Number(parts[1] || 0), Number(parts[2] || 0));
+    return dateValue;
+  }
+
   const dateRaw = String(dateValue || "").trim();
-  if (!dateRaw) return null;
+  if (!dateRaw || dateRaw.toLowerCase() === "null" || dateRaw.toLowerCase() === "undefined") return null;
 
   const timeRaw = String(timeValue || "").trim();
   const normalizedTime = normalizeTime(timeRaw) || "00:00:00";
@@ -19,22 +29,31 @@ function parseDateTime(dateValue?: string | null, timeValue?: string | null): Da
   const mm = Number(parts[1] || 0);
   const ss = Number(parts[2] || 0);
 
+  // 1. ISO format (YYYY-MM-DD or YYYY-MM-DDTHH:mm:ss...)
+  if (dateRaw.includes("-") && dateRaw.indexOf("-") === 4) {
+    const dt = new Date(dateRaw);
+    if (!Number.isNaN(dt.getTime())) {
+      dt.setUTCHours(hh, mm, ss);
+      return dt;
+    }
+  }
+
+  // 2. DMY format (DD/MM/YYYY or DD-MM-YYYY)
   const dmy = dateRaw.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})$/);
   if (dmy) {
     const day = Number(dmy[1]);
     const month = Number(dmy[2]);
-    const year = Number(dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3]);
+    const yearRaw = dmy[3];
+    const year = yearRaw.length === 2 ? Number(`20${yearRaw}`) : Number(yearRaw);
     const dt = new Date(Date.UTC(year, month - 1, day, hh, mm, ss));
     return Number.isNaN(dt.getTime()) ? null : dt;
   }
 
-  const ymd = dateRaw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
-  if (ymd) {
-    const year = Number(ymd[1]);
-    const month = Number(ymd[2]);
-    const day = Number(ymd[3]);
-    const dt = new Date(Date.UTC(year, month - 1, day, hh, mm, ss));
-    return Number.isNaN(dt.getTime()) ? null : dt;
+  // 3. Fallback: try native Date parser
+  const fallbackDt = new Date(dateRaw);
+  if (!Number.isNaN(fallbackDt.getTime())) {
+    fallbackDt.setUTCHours(hh, mm, ss);
+    return fallbackDt;
   }
 
   return null;
