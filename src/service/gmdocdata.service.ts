@@ -52,19 +52,20 @@ export async function getGMFileData(file: string) {
     try {
       let maxRetries = 3;
       let lastError: any = null;
-
+      console.log("GM data ocr start")
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
           console.log(`[GM][OCR] Calling OCR service (Attempt ${attempt}/${maxRetries})`);
           const response = await axios.post(
-            "https://ocrappnwrsup-bwhhbsenaeb8gqdm.canadacentral-01.azurewebsites.net/ocr",
+            "https://pdfocrazure.azurewebsites.net/ocr",
             {
-              pdfBase64: normalizedFile,
+              pdf: file
             },
             { timeout: 1200000 }
           );
 
           extractedText = String(response?.data?.text || "").trim();
+          console.log("Extracted text", extractedText)
           if (extractedText) break; // Success, exit loop
         } catch (err: any) {
           lastError = err;
@@ -150,7 +151,7 @@ YOUR GOAL: Extract EVERY row from EVERY table in this specific text chunk.
   "subject": "${isFirstChunk ? "Extract" : "Ignore"}",
   "reference": "${isFirstChunk ? "Extract" : "Ignore"}",
   "plan_head": "${isFirstChunk ? "Extract" : "Ignore"}",
-  "gm_approval_date": "${isFirstChunk ? "Extract the main letter date in DD.MM.YYYY format" : "Ignore"}",
+  "gm_approval_date": "${isFirstChunk ? "string (DD.MM.YYYY)" : "Ignore"}",
   "works": [
     { 
       "sn": "string", 
@@ -170,10 +171,14 @@ ${chunkText}
       const chunkResult = await getGpt4oResponse(jsonPrompt, {});
 
       if (isFirstChunk) {
-        consolidatedData.letter_no = chunkResult.letter_no;
-        consolidatedData.subject = chunkResult.subject;
-        consolidatedData.reference = chunkResult.reference;
-        consolidatedData.plan_head = chunkResult.plan_head;
+        consolidatedData.letter_no = chunkResult.letter_no || consolidatedData.letter_no;
+        consolidatedData.subject = chunkResult.subject || consolidatedData.subject;
+        consolidatedData.reference = chunkResult.reference || consolidatedData.reference;
+        consolidatedData.plan_head = chunkResult.plan_head || consolidatedData.plan_head;
+      }
+
+      // Take the first non-Ignore/non-null date found in any chunk
+      if (!consolidatedData.gm_approval_date && chunkResult.gm_approval_date && chunkResult.gm_approval_date !== "Ignore") {
         consolidatedData.gm_approval_date = chunkResult.gm_approval_date;
       }
 

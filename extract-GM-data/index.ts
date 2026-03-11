@@ -77,8 +77,10 @@ const httpTrigger: AzureFunction = async function (
     const dbWrite = await persistGmData(processedData, targetSNo, fileName, fileUrl);
     console.log(`[${traceId}] DB write result`, dbWrite);
 
+    const responseStatus = dbWrite.saved ? 200 : 409;
+
     context.res = {
-      status: dbWrite.saved ? 200 : 409,
+      status: responseStatus,
       body: {
         traceId,
         ...processedData,
@@ -86,7 +88,7 @@ const httpTrigger: AzureFunction = async function (
       },
     };
 
-    console.log(`[${traceId}] GM response sent`, { status: 200 });
+    console.log(`[${traceId}] GM response sent`, { status: responseStatus });
   } catch (error: any) {
     console.error(`[${traceId}] GM extract failed`, error);
     const status = error instanceof GmOcrError ? error.statusCode : 500;

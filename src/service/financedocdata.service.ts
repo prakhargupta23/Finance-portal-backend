@@ -1,9 +1,9 @@
 import { getGpt4oResponse } from "./ai.service";
-import axios from "axios";
+const pdf = require("pdf-parse");
 
 export async function getfiledata(prompt: string, file: string) {
     try {
-        console.log("[FIN][OCR] Input received", {
+        console.log("[FIN][PDF] Input received", {
             hasFile: Boolean(file),
             fileLength: file?.length ?? 0,
             promptLength: prompt?.length ?? 0
@@ -12,25 +12,24 @@ export async function getfiledata(prompt: string, file: string) {
         let extractedText = "";
 
         try {
-            console.log("[FIN][OCR] Calling OCR service");
-            const response = await axios.post(
-                "https://ocrappnwrsup-bwhhbsenaeb8gqdm.canadacentral-01.azurewebsites.net/ocr",
-                {
-                    pdfBase64: file
-                }
-            );
+            console.log("[FIN][PDF] Extracting text from PDF");
 
-            extractedText = response.data.text;
-            console.log("[FIN][OCR] OCR response received", {
+            // Convert base64 → buffer
+            const pdfBuffer = Buffer.from(file, "base64");
+
+            // Extract text
+            const data = await pdf(pdfBuffer);
+
+            extractedText = data.text;
+
+            console.log("[FIN][PDF] Text extraction successful", {
                 textLength: extractedText?.length ?? 0
             });
 
-            console.log("========== RAW OCR TEXT ==========");
-            console.log(extractedText);
-            console.log("==================================");
+            console.log("extracted changes ", extractedText);
 
         } catch (error: any) {
-            console.error("[FIN][OCR] OCR Error:", error.response?.data || error.message);
+            console.error("[FIN][PDF] PDF Extraction Error:", error.message);
         }
 
         const jsonPrompt = `${prompt}
@@ -41,13 +40,13 @@ CRITICAL RULES:
 1. Extract plan_head exactly as written.
 2. Extract work_name exactly as written.
 3. Extract designation, date and time from the approval flow.
-   
+
 DESIGNATION EXTRACTION RULES (VERY IMPORTANT):
 - Keep the COMPLETE designation exactly as it appears, including everything after the forward slash (/).
 - Examples:
-  * If text shows "SR. DFM/JU" → extract as "SR. DFM/JU" (NOT "SR. DFM")
-  * If text shows "SDEE/JU" → extract as "SDEE/JU" (NOT "SDEE")
-  * If text shows "CCM/NWR" → extract as "CCM/NWR" (NOT "CCM")
+  * If text shows "SR. DFM/JU" → extract as "SR. DFM/JU"
+  * If text shows "SDEE/JU" → extract as "SDEE/JU"
+  * If text shows "CCM/NWR" → extract as "CCM/NWR"
   * If text shows "Sr. DEN (Co)/JU" → extract as "Sr. DEN (Co)/JU"
   * If text shows "SRDEN/ CENTRAL" → extract as "SRDEN/CENTRAL"
 - DO NOT remove or truncate anything after the "/" character
@@ -73,26 +72,24 @@ OCR TEXT:
 ${extractedText}
 `;
 
-        console.log("[FIN][GPT] Sending OCR text to GPT", {
+        console.log("[FIN][GPT] Sending extracted text to GPT", {
             promptLength: jsonPrompt.length,
             textLength: extractedText?.length ?? 0
         });
+
         const data = await getGpt4oResponse(jsonPrompt, { extractedText });
 
         console.log("========== GPT OUTPUT ==========");
         console.log(JSON.stringify(data, null, 2));
         console.log("================================");
 
-        // ✅ Return data with raw OCR text for fallback processing
         return {
             ...data,
             raw_text: extractedText
-        } as any; // ← Add this to avoid TypeScript errors
+        } as any;
 
     } catch (error) {
         console.error("Error in getfiledata:", error);
         throw error;
     }
 }
-
-

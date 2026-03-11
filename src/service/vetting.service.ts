@@ -39,13 +39,14 @@ export function normalizeText(value?: string | null): string {
     ];
 
     junkPatterns.forEach(pattern => {
-        raw = raw.split(pattern).join("");
+        raw = raw.split(pattern).join(" ");
     });
 
-    // 2. Clean up characters and extra spaces
+    // 2. Clean up: replace all non-alphanumeric chars with spaces,
+    // then condense multiple spaces into one.
     return raw
+        .replace(/[^A-Z0-9]/g, " ")
         .replace(/\s+/g, " ")
-        .replace(/[^A-Z0-9 ]/g, "")
         .trim();
 }
 
@@ -98,6 +99,50 @@ function calculateSimilarity(str1: string, str2: string): number {
     }
 
     return matches / smaller.length;
+}
+
+function normalizeSNo(value?: string | null): string {
+    return String(value || "").trim().toUpperCase();
+}
+
+function findBestGmMatch(
+    gmCandidates: any[],
+    workSNo: string | null | undefined,
+    workPlanheadNorm: string | null,
+    workNameRaw: string | null | undefined,
+    workNameNorm: string
+): any | undefined {
+    const targetSNo = normalizeSNo(workSNo);
+    const sNoScoped = targetSNo
+        ? gmCandidates.filter((g) => normalizeSNo(g?.s_no) === targetSNo)
+        : [];
+
+    const primaryPool = sNoScoped.length > 0 ? sNoScoped : gmCandidates;
+
+    let matchedGm = primaryPool.find((g) =>
+        isPlanheadMatch(g.planhead, workPlanheadNorm) &&
+        normalizeText(g.workname) === workNameNorm
+    );
+
+    if (!matchedGm && workNameNorm) {
+        let bestSim = 0;
+        for (const candidate of primaryPool) {
+            if (isPlanheadMatch(candidate.planhead, workPlanheadNorm)) {
+                const sim = calculateSimilarity(workNameRaw || "", candidate?.workname || "");
+                if (sim > 0.50 && sim > bestSim) {
+                    bestSim = sim;
+                    matchedGm = candidate;
+                }
+            }
+        }
+    }
+
+    // If S.No matched but planhead/workname did not, still prefer same S.No row.
+    if (!matchedGm && sNoScoped.length > 0) {
+        matchedGm = sNoScoped[0];
+    }
+
+    return matchedGm;
 }
 
 export async function persistVettingData(
@@ -268,9 +313,23 @@ export async function getAggregateDelayData(
         if (worksInPh.length === 0) return null;
 
         const isSingleWork = Boolean(requestedWorkheadNorm || sNo);
-        const gmWhere: any = { gmApprovalDate: { [Op.ne]: null } };
-        if (sNo) gmWhere.s_no = sNo;
-        else if (requestedPlanhead) gmWhere.planhead = requestedPlanhead;
+        const gmWhere: any = {};
+        if (sNo) {
+            const trimmedSNo = String(sNo).trim();
+            gmWhere[Op.or] = [
+                { s_no: trimmedSNo },
+                sequelize.where(sequelize.fn('TRIM', sequelize.col('s_no')), trimmedSNo)
+            ];
+        } else if (requestedPlanhead) {
+            // RELAXED PLANHEAD MATCH:
+            // Extract numeric part (e.g. "17" from "17-Computerisation") to find "PH-17", "17", etc.
+            const phNumeric = normalizePlanhead(requestedPlanhead);
+            if (phNumeric) {
+                gmWhere.planhead = { [Op.like]: `%${phNumeric}%` };
+            } else {
+                gmWhere.planhead = requestedPlanhead;
+            }
+        }
 
         const gmCandidates: any[] = await GmApprovalData.findAll({
             where: gmWhere,
@@ -295,23 +354,13 @@ export async function getAggregateDelayData(
             const targetWorknameNorm = normalizeText((target as any).workname);
             const targetPHNorm = normalizePlanhead((target as any).planhead);
 
-            let matchedGm = gmCandidates.find(g =>
-                isPlanheadMatch(g.planhead, targetPHNorm) &&
-                normalizeText(g.workname) === targetWorknameNorm
+            const matchedGm = findBestGmMatch(
+                gmCandidates,
+                (target as any).s_no,
+                targetPHNorm,
+                (target as any).workname,
+                targetWorknameNorm
             );
-
-            if (!matchedGm && targetWorknameNorm) {
-                let bestSim = 0;
-                for (const candidate of gmCandidates) {
-                    if (isPlanheadMatch(candidate.planhead, targetPHNorm)) {
-                        const sim = calculateSimilarity((target as any).workname, candidate?.workname || "");
-                        if (sim > 0.50 && sim > bestSim) {
-                            bestSim = sim;
-                            matchedGm = candidate;
-                        }
-                    }
-                }
-            }
 
             const delays = calculateBucketDelay(
                 flowItems as any[],
@@ -358,18 +407,13 @@ export async function getAggregateDelayData(
             flowMap.set(item.flowUuid, list);
         });
 
-        const gmMap = new Map<string, any[]>();
-        for (const g of gmCandidates) {
-            const phKey = normalizePlanhead(g.planhead);
-            const list = gmMap.get(phKey) || [];
-            list.push(g);
-            gmMap.set(phKey, list);
-        }
-
+        // 1. Build a robust GM map that handles multi-planhead records (e.g. "17, 29")
         let totalExec = 0, totalFin = 0, totalHq = 0;
         let countExec = 0, countFin = 0, countHq = 0;
         let totalCycleSum = 0;
         let countCycle = 0;
+
+        const targetPHNorm = requestedPlanhead ? normalizePlanhead(requestedPlanhead) : null;
 
         for (const work of worksInPh) {
             const flowItems = flowMap.get((work as any).uuid) || [];
@@ -378,28 +422,15 @@ export async function getAggregateDelayData(
             const workNameNorm = normalizeText((work as any).workname);
             const workPHNorm = normalizePlanhead((work as any).planhead);
             const workSNo = (work as any).s_no;
+            const currentWorkPHNorm = workPHNorm || targetPHNorm;
 
-            const phCandidates = gmMap.get(workPHNorm) || [];
-
-            let matchedGm = phCandidates.find(g =>
-                (workSNo && String(g.s_no) === String(workSNo)) &&
-                normalizeText(g.workname) === workNameNorm
+            const matchedGm = findBestGmMatch(
+                gmCandidates,
+                workSNo,
+                currentWorkPHNorm,
+                (work as any).workname,
+                workNameNorm
             );
-
-            if (!matchedGm) {
-                matchedGm = phCandidates.find(g => normalizeText(g.workname) === workNameNorm);
-            }
-
-            if (!matchedGm && workNameNorm) {
-                let bestSim = 0;
-                for (const candidate of phCandidates) {
-                    const sim = calculateSimilarity((work as any).workname, candidate?.workname || "");
-                    if (sim > 0.60 && sim > bestSim) {
-                        bestSim = sim;
-                        matchedGm = candidate;
-                    }
-                }
-            }
 
             const delays = calculateBucketDelay(
                 flowItems,
@@ -455,7 +486,16 @@ export async function getTableData(cursor?: string | null, limitStr?: string): P
     try {
         const limit = Math.max(1, parseInt(limitStr || "10"));
 
-        const whereClause: any = {};
+        const whereClause: any = {
+            // Only return rows where at least one document has been uploaded
+            [Op.or]: [
+                { drm_app_uploaded: true },
+                { dg_letter_uploaded: true },
+                { estimate_uploaded: true },
+                { func_distribution_uploaded: true },
+                { top_sheet_uploaded: true }
+            ]
+        };
         if (cursor) {
             // Use createdAt as the cursor for descending order
             whereClause.createdAt = { [Op.lt]: new Date(cursor) };
@@ -466,24 +506,82 @@ export async function getTableData(cursor?: string | null, limitStr?: string): P
         const { count, rows } = await DocumentMaster.findAndCountAll({
             where: whereClause,
             limit,
+            distinct: true,
             order: [["createdAt", "DESC"]],
+            include: [
+                {
+                    model: WorkVettingDesignationFlow,
+                    as: 'flowData',
+                    attributes: ['uuid', 'planhead', 'workname', 'createdAt'],
+                    separate: true,
+                    limit: 1,
+                    order: [["createdAt", "DESC"]]
+                },
+                {
+                    model: GmApprovalData,
+                    as: 'gmData',
+                    attributes: ['planhead', 'workname', 'createdAt'],
+                    separate: true,
+                    limit: 1,
+                    order: [["createdAt", "DESC"]]
+                }
+            ]
         });
 
         console.log(`[DB] DocumentMaster results: count=${count}, rows=${rows.length}`);
 
-        const results = rows.map((master: any) => {
-            const data = master.toJSON() as any;
+        const results: any[] = [];
+        rows.forEach((master: any) => {
+            const masterData = master.toJSON() as any;
+
             const required = ['drm_app_uploaded', 'dg_letter_uploaded', 'estimate_uploaded', 'func_distribution_uploaded', 'top_sheet_uploaded'];
-            const uploadedCount = required.filter(key => data[key]).length;
-            return {
-                ...data,
+            const uploadedCount = required.filter(key => masterData[key]).length;
+            const completionParams = {
                 isReadyForVetting: uploadedCount === required.length,
                 completionCount: `${uploadedCount}/${required.length}`
             };
+
+            // Pick Plan Head & Work Name from the first available child project (for display only)
+            const latestFlow = (masterData.flowData || [])[0] || null;
+            const latestGm = (masterData.gmData || [])[0] || null;
+            const allProjects = [latestFlow, latestGm].filter(Boolean);
+
+            let displayPh = "--";
+            let displayWn = "--";
+
+            if (allProjects.length > 0) {
+                // Find the first project with a valid planhead
+                const withPh = allProjects.find((p: any) => {
+                    const ph = (p.planhead || "").trim();
+                    return ph && ph !== "--" && ph.toUpperCase() !== "NULL" && /\d/.test(ph);
+                });
+                const first = withPh || allProjects[0];
+
+                displayPh = (first.planhead || "").trim();
+                displayWn = (first.workname || "").trim();
+
+                // AUTO-RECOVERY: Extract PH from work name if planhead is empty
+                if (!displayPh || displayPh === "--" || displayPh.toUpperCase() === "NULL" || !/\d/.test(displayPh)) {
+                    const phMatch = displayWn.match(/(\d+)-/) || displayWn.match(/\bPH[- ]?(\d+)\b/i);
+                    displayPh = phMatch ? phMatch[1] : "--";
+                }
+            }
+
+            // Remove child arrays from the response to keep it clean
+            delete masterData.flowData;
+            delete masterData.gmData;
+
+            // EXACTLY 1 ROW PER S.No
+            results.push({
+                ...masterData,
+                planhead: displayPh,
+                workname: displayWn,
+                projectCount: allProjects.length,
+                ...completionParams
+            });
         });
 
-        // The next cursor is the createdAt of the last element in the current result set
-        const nextCursor = results.length > 0 ? results[results.length - 1].createdAt : null;
+        const nextCursor = rows.length > 0 ? (rows[rows.length - 1] as any).createdAt : null;
 
         return {
             total: count,
