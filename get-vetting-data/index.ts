@@ -1,5 +1,5 @@
 import { AzureFunction, Context, HttpRequest } from "@azure/functions";
-import {getVettingData} from '../src/service/vetting.service';
+import { getVettingData } from '../src/service/vetting.service';
 
 const httpTrigger: AzureFunction = async function (
     context: Context,
@@ -7,8 +7,10 @@ const httpTrigger: AzureFunction = async function (
 ): Promise<void> {
 
     try {
+        const startDate = (req.query as any)?.startDate || (req.body as any)?.startDate || null;
+        const endDate = (req.query as any)?.endDate || (req.body as any)?.endDate || null;
 
-        const vettingData = await getVettingData();
+        const vettingData = await getVettingData(startDate, endDate);
 
         context.res = {
             status: 200,
