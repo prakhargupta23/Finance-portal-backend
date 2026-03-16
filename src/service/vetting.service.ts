@@ -4,7 +4,39 @@ import GmApprovalData from "../Model/GmApprovalData.model";
 import DocumentMaster from "../Model/DocumentMaster.model";
 import sequelize from "../config/sequelize";
 import { calculateBucketDelay } from "./delay.service";
+import ManualGmDateOverride from "../Model/ManualGmDateOverride.model";
 import { Op } from "sequelize";
+
+// Ensure the override table exists (fixes 'Invalid object name' error)
+let isSynced = false;
+let syncError: Error | null = null;
+
+const syncPromise = ManualGmDateOverride.sync()
+    .then(() => {
+        isSynced = true;
+        console.log("[FIN][DB] ManualGmDateOverride table synchronized.");
+    })
+    .catch(err => {
+        syncError = err;
+        console.error("[FIN][DB] Failed to sync ManualGmDateOverride table:", err);
+    });
+
+async function ensureSynced() {
+    if (!isSynced) {
+        if (syncError) {
+            console.log("[FIN][DB] Retrying synchronization...");
+            try {
+                await ManualGmDateOverride.sync();
+                isSynced = true;
+                syncError = null;
+            } catch (retryErr: any) {
+                throw new Error(`Database Synchronization Failed: ${retryErr.message}`);
+            }
+        } else {
+            await syncPromise;
+        }
+    }
+}
 
 export type DbWriteResult = {
     saved: boolean;
@@ -320,7 +352,8 @@ export async function getAggregateDelayData(
         endDate
     } = options;
     try {
-        const requestedPlanhead = String(planhead || "").trim() || null;
+        const rawPh = String(planhead || "").trim().toUpperCase();
+        const requestedPlanhead = (rawPh && rawPh !== "ALL_PLAN_HEADS" && rawPh !== "NULL") ? rawPh : null;
         const requestedWorkheadNorm = normalizeText(workhead);
 
         // 1. Optimized Fetch: Only get works for the requested planhead
@@ -357,11 +390,23 @@ export async function getAggregateDelayData(
             } else {
                 gmWhere.planhead = requestedPlanhead;
             }
+        } else {
+            // For ALL_PLAN_HEADS or grouped mode, limit the scan to the s_no's present in the time horizon
+            const sNos = Array.from(new Set(worksInPh.map(w => String((w as any).s_no || "").trim()).filter(Boolean)));
+            if (sNos.length > 0) {
+                gmWhere.s_no = { [Op.in]: sNos };
+            }
         }
 
         const gmCandidates: any[] = await GmApprovalData.findAll({
             where: gmWhere,
             attributes: ['s_no', 'planhead', 'workname', 'gmApprovalDate', 'gmApprovalTime', 'sanctioned_cost', 'division', 'allocation', 'executing_agency'],
+            raw: true,
+        });
+
+        const manualOverrides: any[] = await ManualGmDateOverride.findAll({
+            where: gmWhere,
+            attributes: ['s_no', 'planhead', 'workname', 'manualGmDate', 'addedByRole'],
             raw: true,
         });
 
@@ -390,9 +435,21 @@ export async function getAggregateDelayData(
                 targetWorknameNorm
             );
 
+            const matchedOverride = findBestGmMatch(
+                manualOverrides,
+                (target as any).s_no,
+                targetPHNorm,
+                (target as any).workname,
+                targetWorknameNorm
+            );
+
+            const finalGmDate = matchedOverride ? matchedOverride.manualGmDate : (matchedGm?.gmApprovalDate ?? null);
+            const isManualOverride = !!matchedOverride;
+            const overriddenBy = matchedOverride ? matchedOverride.addedByRole : null;
+
             const delays = calculateBucketDelay(
                 flowItems as any[],
-                matchedGm?.gmApprovalDate ?? null,
+                finalGmDate,
                 matchedGm?.gmApprovalTime ?? null
             );
 
@@ -406,7 +463,9 @@ export async function getAggregateDelayData(
                     division: matchedGm?.division ?? null,
                     allocation: matchedGm?.allocation ?? null,
                     executing_agency: matchedGm?.executing_agency ?? null,
-                    gmApprovalDate: matchedGm?.gmApprovalDate ?? null
+                    gmApprovalDate: finalGmDate,
+                    isManualOverride,
+                    overriddenBy
                 }
             };
         }
@@ -441,6 +500,7 @@ export async function getAggregateDelayData(
                 totalFin: number, countFin: number,
                 totalHq: number, countHq: number,
                 totalCycle: number, countCycle: number,
+                totalLoops: number, countWorksWithLoops: number,
                 worksCount: number
             }>();
 
@@ -452,6 +512,7 @@ export async function getAggregateDelayData(
                         totalFin: 0, countFin: 0,
                         totalHq: 0, countHq: 0,
                         totalCycle: 0, countCycle: 0,
+                        totalLoops: 0, countWorksWithLoops: 0,
                         worksCount: 0
                     });
                 }
@@ -473,9 +534,19 @@ export async function getAggregateDelayData(
                     workNameNorm
                 );
 
+                const matchedOverride = findBestGmMatch(
+                    manualOverrides,
+                    workSNo,
+                    workPHNorm,
+                    (work as any).workname,
+                    workNameNorm
+                );
+
+                const finalGmDate = matchedOverride ? matchedOverride.manualGmDate : (matchedGm?.gmApprovalDate ?? null);
+
                 const delays = calculateBucketDelay(
                     flowItems,
-                    matchedGm?.gmApprovalDate ?? null,
+                    finalGmDate,
                     matchedGm?.gmApprovalTime ?? null
                 );
 
@@ -495,6 +566,12 @@ export async function getAggregateDelayData(
                     stats.totalCycle += (delays.totalCycleDays || 0);
                     stats.countCycle++;
                 }
+
+                if (delays.nwrLoops && delays.nwrLoops.length > 0) {
+                    const loopDays = delays.nwrLoops.reduce((sum: number, l: any) => sum + (l.delayDays || 0), 0);
+                    stats.totalLoops += loopDays;
+                    stats.countWorksWithLoops++;
+                }
             }
 
             const results: any[] = [];
@@ -506,6 +583,7 @@ export async function getAggregateDelayData(
                     executiveDelayDays: stats.countExec > 0 ? Math.round(stats.totalExec / stats.countExec) : 0,
                     financeDelayDays: stats.countFin > 0 ? Math.round(stats.totalFin / stats.countFin) : 0,
                     hqDelayDays: stats.countHq > 0 ? Math.round(stats.totalHq / stats.countHq) : 0,
+                    nwrLoopCycleAvg: stats.countWorksWithLoops > 0 ? Math.round(stats.totalLoops / stats.countWorksWithLoops) : 0,
                 });
             });
             return results.filter(r => r.totalWorks > 0).sort((a, b) => b.totalCycleDays - a.totalCycleDays);
@@ -516,6 +594,8 @@ export async function getAggregateDelayData(
         let countExec = 0, countFin = 0, countHq = 0;
         let totalCycleSum = 0;
         let countCycle = 0;
+        let totalLoopsSum = 0;
+        let countWorksWithLoops = 0;
 
         const targetPHNorm = requestedPlanhead ? normalizePlanhead(requestedPlanhead) : null;
 
@@ -536,9 +616,19 @@ export async function getAggregateDelayData(
                 workNameNorm
             );
 
+            const matchedOverride = findBestGmMatch(
+                manualOverrides,
+                workSNo,
+                currentWorkPHNorm,
+                (work as any).workname,
+                workNameNorm
+            );
+
+            const finalGmDate = matchedOverride ? matchedOverride.manualGmDate : (matchedGm?.gmApprovalDate ?? null);
+
             const delays = calculateBucketDelay(
                 flowItems,
-                matchedGm?.gmApprovalDate ?? null,
+                finalGmDate,
                 matchedGm?.gmApprovalTime ?? null
             );
 
@@ -558,12 +648,19 @@ export async function getAggregateDelayData(
                 totalCycleSum += (delays.totalCycleDays || 0);
                 countCycle++;
             }
+
+            if (delays.nwrLoops && delays.nwrLoops.length > 0) {
+                const loopDays = delays.nwrLoops.reduce((sum: number, l: any) => sum + (l.delayDays || 0), 0);
+                totalLoopsSum += loopDays;
+                countWorksWithLoops++;
+            }
         }
 
         const avgExec = countExec > 0 ? Math.round(totalExec / countExec) : 0;
         const avgFin = countFin > 0 ? Math.round(totalFin / countFin) : 0;
         const avgHq = countHq > 0 ? Math.round(totalHq / countHq) : 0;
-        const avgTotalCycle = countCycle > 0 ? Math.round(totalCycleSum / countCycle) : (avgExec + avgFin + avgHq);
+        const avgLoops = countWorksWithLoops > 0 ? Math.round(totalLoopsSum / countWorksWithLoops) : 0;
+        const avgTotalCycle = Math.max(0, Math.round(avgExec + avgFin + avgHq + avgLoops));
 
         return {
             workname: "Averages for " + (requestedPlanhead || "All"),
@@ -573,10 +670,11 @@ export async function getAggregateDelayData(
             executiveDelayDays: avgExec,
             financeDelayDays: avgFin,
             hqDelayDays: avgHq,
+            nwrLoopCycleAvg: avgLoops,
             meta: {
                 aggregated: true,
                 divisor: worksInPh.length,
-                counts: { exec: countExec, fin: countFin, hq: countHq, total: countCycle }
+                counts: { exec: countExec, fin: countFin, hq: countHq, total: countCycle, loopWorks: countWorksWithLoops }
             }
         };
 
@@ -719,7 +817,7 @@ export async function getMasterStatus(sNo: string): Promise<any> {
     }
 }
 
-export async function getLatestMaster(): Promise<any> {
+export async function getLatestMaster() {
     try {
         const master = await DocumentMaster.findOne({
             order: [["createdAt", "DESC"]]
@@ -728,5 +826,43 @@ export async function getLatestMaster(): Promise<any> {
     } catch (error: any) {
         console.error("Error in getLatestMaster:", error);
         throw new Error("Failed to fetch latest master");
+    }
+}
+
+export async function addManualGmDate(
+    sNo: string,
+    planhead: string,
+    workname: string,
+    manualGmDate: string,
+    addedByRole: string
+): Promise<any> {
+    try {
+        await ensureSynced();
+        // UPSERT LOGIC: If same project exists, update it.
+        const record = await ManualGmDateOverride.findOne({
+            where: { s_no: sNo }
+        });
+
+        if (record) {
+            await record.update({
+                planhead,
+                workname,
+                manualGmDate,
+                addedByRole: addedByRole || record.addedByRole
+            });
+            return record;
+        }
+
+        const newRecord = await ManualGmDateOverride.create({
+            s_no: sNo,
+            planhead,
+            workname,
+            manualGmDate,
+            addedByRole,
+        });
+        return newRecord;
+    } catch (error: any) {
+        console.error("Error adding manual GM date:", error);
+        throw new Error("Failed to add manual GM date override: " + error.message);
     }
 }
