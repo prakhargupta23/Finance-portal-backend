@@ -7,11 +7,9 @@ const httpTrigger: AzureFunction = async function (
 ): Promise<void> {
 
     try {
-        const startDate = (req.query as any)?.startDate || (req.body as any)?.startDate || null;
-        const endDate = (req.query as any)?.endDate || (req.body as any)?.endDate || null;
-
-        const vettingData = await getVettingData(startDate, endDate);
-
+        console.log("Fetching vetting data");
+        const vettingData = await getVettingData();
+        console.log("returning to frontend")
         context.res = {
             status: 200,
             body: {
