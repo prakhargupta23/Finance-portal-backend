@@ -27,10 +27,25 @@ const httpTrigger: AzureFunction = async function (
         const strictRaw = String(queryStrict ?? bodyStrict ?? "true").trim().toLowerCase();
         const strict = !(strictRaw === "false" || strictRaw === "0" || strictRaw === "no");
 
-        const delayData = await getAggregateDelayData(planhead, workhead, sNo, strict);
+        const queryGrouped = (req.query as any)?.grouped;
+        const bodyGrouped = (req.body as any)?.grouped;
+        const grouped = String(queryGrouped ?? bodyGrouped ?? "false").trim().toLowerCase() === "true";
+
+        const startDate = (req.query as any)?.startDate || (req.body as any)?.startDate || null;
+        const endDate = (req.query as any)?.endDate || (req.body as any)?.endDate || null;
+
+        const delayData = await getAggregateDelayData({
+            planhead,
+            workhead,
+            sNo,
+            strictMatch: strict,
+            groupedByPlanhead: grouped,
+            startDate,
+            endDate
+        });
         const hasRequestedFilter = Boolean(planhead || workhead);
 
-        if (hasRequestedFilter && !delayData) {
+        if (!grouped && hasRequestedFilter && !delayData) {
             context.res = {
                 status: 404,
                 body: {
@@ -42,7 +57,7 @@ const httpTrigger: AzureFunction = async function (
 
         context.res = {
             status: 200,
-            body: {
+            body: grouped ? delayData : {
                 ...delayData,
                 gmApprovalDate: delayData?.meta?.gmApprovalDate ?? null,
             },
